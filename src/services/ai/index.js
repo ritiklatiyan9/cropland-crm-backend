@@ -103,7 +103,10 @@ async function toInlineData(url) {
   return { base64: buf.toString('base64'), mime: res.headers.get('content-type') || 'image/jpeg' };
 }
 
-const EMBED_MODEL = 'text-embedding-004';
+const EMBED_MODEL = env.ai?.embeddingModel || 'gemini-embedding-001';
+// Output dimension — must equal the Pinecone index dimension. gemini-embedding-001
+// supports Matryoshka truncation (768/1536/3072); we use 768 to match the index.
+const EMBED_DIM = env.ai?.embeddingDim || 768;
 
 /** Embed text into a vector with Gemini's embedding model. Returns number[] or null. */
 export async function embedText(text) {
@@ -111,7 +114,7 @@ export async function embedText(text) {
   try {
     const res = await fetch(`${GEMINI}/${EMBED_MODEL}:embedContent?key=${KEY}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: `models/${EMBED_MODEL}`, content: { parts: [{ text }] } }),
+      body: JSON.stringify({ model: `models/${EMBED_MODEL}`, content: { parts: [{ text }] }, outputDimensionality: EMBED_DIM }),
     });
     if (!res.ok) throw new Error(`embed ${res.status}`);
     const data = await res.json();

@@ -6,6 +6,7 @@ import { query } from '../../db/index.js';
 import { assertAuth, assertRole } from '../context.js';
 import { httpError, logActivity, num, isoDate } from '../helpers.js';
 import { diagnoseCrop, generateAdvisory as genAdvisory, aiChannelStatus, embedSample, cosineSim } from '../../services/ai/index.js';
+import { upsertSample, deleteSamples, querySimilar, vectorStoreStatus, pineconeConfigured } from '../../services/ai/pinecone.js';
 import { sendEmail } from '../../services/notify/email.js';
 
 export const aiTypeDefs = /* GraphQL */ `
@@ -96,7 +97,9 @@ export const aiTypeDefs = /* GraphQL */ `
     isActive: Boolean!
     createdAt: DateTime!
   }
-  type TrainingStats { classes: Int!, samples: Int!, crops: Int!, aiConfigured: Boolean!, model: String!, embeddingModel: String! }
+  type VectorStoreStatus { provider: String!, configured: Boolean!, ready: Boolean!, index: String!, namespace: String!, vectorCount: Int }
+  type ReindexResult { total: Int!, processed: Int!, failed: Int! }
+  type TrainingStats { classes: Int!, samples: Int!, crops: Int!, aiConfigured: Boolean!, model: String!, embeddingModel: String!, vectorStore: VectorStoreStatus! }
 
   input TrainingClassInput { crop: String!, disease: String!, pathogen: String, description: String, symptoms: String, treatment: String, productIds: [ID!] }
   input TrainingSampleInput { imageUrl: String!, imageKey: String, caption: String }
@@ -154,6 +157,7 @@ export const aiTypeDefs = /* GraphQL */ `
     deleteTrainingClass(id: ID!): Boolean!
     addTrainingSample(classId: ID!, input: TrainingSampleInput!): AiTrainingSample!
     deleteTrainingSample(id: ID!): Boolean!
+    reindexTrainingData: ReindexResult!
   }
 `;
 
@@ -185,8 +189,33 @@ const mapClass = (r) => r && {
 
 // Retrieval-augmented reference selection (RAG): rank the trained photos for a
 // crop by visual-embedding similarity to the farmer's photo and return the most
-// relevant ones. Falls back to most-recent when embeddings/AI aren't available.
+// relevant ones. Retrieval ladder, best → simplest:
+//   1. Pinecone vector search (scales to large training sets)
+//   2. Postgres + in-memory cosine over cached Gemini embeddings
+//   3. Most-recent labelled examples (still grounds the model, just not ranked)
 async function getTrainingReferences(crop, queryImageUrl) {
+  // Embed the farmer's photo once; reused by both the Pinecone and in-memory paths.
+  const q = queryImageUrl ? await embedSample(queryImageUrl, crop, crop) : null;
+
+  // ── 1) Pinecone managed vector search ──────────────────────────────────────
+  if (q?.vector && pineconeConfigured) {
+    const matches = await querySimilar(q.vector, { crop, topK: 4 });
+    if (matches?.length) {
+      // Pinecone holds lightweight metadata; resolve the image URLs from Postgres
+      // (data: URLs are too large for vector metadata) preserving the ranked order.
+      const ids = matches.map((m) => m.id);
+      const { rows } = await query('SELECT id, image_url, vision_caption FROM ai_training_samples WHERE id = ANY($1)', [ids]);
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      const references = matches.map((m) => {
+        const r = byId.get(m.id);
+        if (!r) return null;
+        return { imageUrl: r.image_url, caption: r.vision_caption ?? m.metadata.caption ?? null, disease: m.metadata.disease ?? null, pathogen: m.metadata.pathogen ?? null };
+      }).filter(Boolean);
+      if (references.length) return { references, retrieval: 'pinecone', topScore: Math.round((matches[0].score ?? 0) * 100) / 100 };
+    }
+  }
+
+  // ── 2) / 3) Postgres-backed fallback ───────────────────────────────────────
   const { rows } = await query(
     `SELECT s.image_url, s.vision_caption, s.embedding, c.disease, c.pathogen
      FROM ai_training_samples s JOIN ai_training_classes c ON c.id = s.class_id
@@ -196,22 +225,33 @@ async function getTrainingReferences(crop, queryImageUrl) {
   if (!rows.length) return { references: [], retrieval: 'none', topScore: 0 };
 
   const embedded = rows.filter((r) => Array.isArray(r.embedding) && r.embedding.length);
-  if (queryImageUrl && embedded.length) {
-    const q = await embedSample(queryImageUrl, crop, crop); // embed the query photo
-    if (q?.vector) {
-      const ranked = embedded
-        .map((r) => ({ r, score: cosineSim(q.vector, r.embedding) }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 4);
-      return {
-        references: ranked.map(({ r }) => ({ imageUrl: r.image_url, caption: r.vision_caption, disease: r.disease, pathogen: r.pathogen })),
-        retrieval: 'embedding', topScore: Math.round((ranked[0]?.score ?? 0) * 100) / 100,
-      };
-    }
+  if (q?.vector && embedded.length) {
+    const ranked = embedded
+      .map((r) => ({ r, score: cosineSim(q.vector, r.embedding) }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 4);
+    return {
+      references: ranked.map(({ r }) => ({ imageUrl: r.image_url, caption: r.vision_caption, disease: r.disease, pathogen: r.pathogen })),
+      retrieval: 'embedding', topScore: Math.round((ranked[0]?.score ?? 0) * 100) / 100,
+    };
   }
-  // Fallback: most-recent labelled examples (still grounds the model, just not ranked).
+  // Most-recent labelled examples (still grounds the model, just not ranked).
   const recent = rows.slice(0, 6).map((r) => ({ imageUrl: r.image_url, caption: r.vision_caption, disease: r.disease, pathogen: r.pathogen }));
   return { references: recent, retrieval: 'recent', topScore: 0 };
+}
+
+// Build the retrieval label + Pinecone metadata for a sample, then embed and
+// upsert it to both Postgres (cache) and Pinecone (vector store). Best-effort:
+// never throws, so it can run in the background without blocking the upload.
+async function indexSample(sampleId, imageUrl, cls) {
+  const label = `${cls.crop} ${cls.disease}${cls.symptoms ? ` — ${cls.symptoms}` : ''}`;
+  const emb = await embedSample(imageUrl, label, cls.crop);
+  if (!emb?.vector) return false;
+  await query('UPDATE ai_training_samples SET embedding=$2, vision_caption=$3 WHERE id=$1', [sampleId, JSON.stringify(emb.vector), emb.caption ?? null]);
+  await upsertSample(sampleId, emb.vector, {
+    classId: cls.id ?? null, crop: String(cls.crop).toLowerCase(), disease: cls.disease, pathogen: cls.pathogen ?? null, caption: emb.caption ?? null,
+  });
+  return true;
 }
 
 // A trained class matching the detected crop+disease (drives curated product recommendations).
@@ -371,7 +411,14 @@ export function aiResolvers() {
                   (SELECT COUNT(DISTINCT lower(crop)) FROM ai_training_classes WHERE is_active)::int crops`,
         );
         const st = aiChannelStatus();
-        return { ...rows[0], aiConfigured: st.configured, model: st.model, embeddingModel: st.embeddingModel };
+        const vs = await vectorStoreStatus();
+        return {
+          ...rows[0], aiConfigured: st.configured, model: st.model, embeddingModel: st.embeddingModel,
+          vectorStore: {
+            provider: vs.provider, configured: vs.configured, ready: vs.ready,
+            index: vs.index, namespace: vs.namespace, vectorCount: vs.vectorCount,
+          },
+        };
       },
     },
 
@@ -524,14 +571,17 @@ export function aiResolvers() {
       },
       deleteTrainingClass: async (_p, { id }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
-        const { rowCount } = await query('DELETE FROM ai_training_classes WHERE id=$1', [id]);
+        // Capture sample ids before the cascade delete so we can purge their vectors.
+        const sampleIds = (await query('SELECT id FROM ai_training_samples WHERE class_id=$1', [id])).rows.map((r) => r.id);
+        const { rowCount } = await query('DELETE FROM ai_training_classes WHERE id=$1', [id]); // CASCADE removes samples
         if (!rowCount) throw httpError('Training class not found', 404);
+        if (sampleIds.length) deleteSamples(sampleIds).catch(() => {}); // best-effort vector cleanup
         await logActivity(a.sub, 'DELETE_TRAINING_CLASS', 'ai_training_class', id);
         return true;
       },
       addTrainingSample: async (_p, { classId, input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
-        const cls = (await query('SELECT crop, disease, symptoms FROM ai_training_classes WHERE id=$1', [classId])).rows[0];
+        const cls = (await query('SELECT id, crop, disease, pathogen, symptoms FROM ai_training_classes WHERE id=$1', [classId])).rows[0];
         if (!cls) throw httpError('Training class not found', 404);
         const count = Number((await query('SELECT COUNT(*) n FROM ai_training_samples WHERE class_id=$1', [classId])).rows[0].n);
         if (count >= MAX_SAMPLES_PER_CLASS) throw httpError(`A class can hold at most ${MAX_SAMPLES_PER_CLASS} photos`, 400);
@@ -540,20 +590,40 @@ export function aiResolvers() {
           [classId, input.imageUrl, input.imageKey ?? null, input.caption ?? null],
         );
         await logActivity(a.sub, 'ADD_TRAINING_SAMPLE', 'ai_training_class', classId);
-        // Best-effort: build a retrieval embedding (caption + vector) so this photo can be
-        // matched against farmer queries. Never blocks the upload if the AI key is absent.
-        const label = `${cls.crop} ${cls.disease}${cls.symptoms ? ` — ${cls.symptoms}` : ''}`;
-        embedSample(input.imageUrl, label, cls.crop)
-          .then((emb) => emb?.vector && query('UPDATE ai_training_samples SET embedding=$2, vision_caption=$3 WHERE id=$1', [rows[0].id, JSON.stringify(emb.vector), emb.caption ?? null]))
-          .catch(() => {});
+        // Best-effort: caption → embed → upsert to Postgres + Pinecone so this photo
+        // can be matched against farmer queries. Never blocks the upload if AI is absent.
+        indexSample(rows[0].id, input.imageUrl, cls).catch(() => {});
         return { id: rows[0].id, imageUrl: rows[0].image_url, caption: rows[0].caption, createdAt: rows[0].created_at };
       },
       deleteTrainingSample: async (_p, { id }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const { rowCount } = await query('DELETE FROM ai_training_samples WHERE id=$1', [id]);
         if (!rowCount) throw httpError('Sample not found', 404);
+        deleteSamples(id).catch(() => {}); // best-effort vector cleanup
         await logActivity(a.sub, 'DELETE_TRAINING_SAMPLE', 'ai_training_sample', id);
         return true;
+      },
+
+      // Re-embed every active training photo and (re)upsert it to Pinecone. Use
+      // after enabling Pinecone/Gemini or to repair drift. Runs synchronously so
+      // the UI can report an exact processed/failed count.
+      reindexTrainingData: async (_p, _a, ctx) => {
+        const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
+        const { rows } = await query(
+          `SELECT s.id, s.image_url, c.id AS class_id, c.crop, c.disease, c.pathogen, c.symptoms
+           FROM ai_training_samples s JOIN ai_training_classes c ON c.id = s.class_id
+           WHERE c.is_active ORDER BY s.created_at`,
+        );
+        let processed = 0;
+        let failed = 0;
+        for (const r of rows) {
+          try {
+            const ok = await indexSample(r.id, r.image_url, { id: r.class_id, crop: r.crop, disease: r.disease, pathogen: r.pathogen, symptoms: r.symptoms });
+            if (ok) processed += 1; else failed += 1;
+          } catch { failed += 1; }
+        }
+        await logActivity(a.sub, 'REINDEX_TRAINING', 'ai_training', null, { processed, failed, total: rows.length });
+        return { total: rows.length, processed, failed };
       },
     },
 

@@ -83,5 +83,22 @@ export const env = {
   ai: {
     geminiApiKey: optional('GEMINI_API_KEY', ''),
     geminiModel: optional('GEMINI_MODEL', 'gemini-2.5-flash'),
+    // gemini-embedding-001 supports Matryoshka truncation; we request 768 dims to
+    // match the Pinecone index dimension.
+    embeddingModel: optional('GEMINI_EMBEDDING_MODEL', 'gemini-embedding-001'),
+    embeddingDim: Number(optional('GEMINI_EMBEDDING_DIM', '768')),
+  },
+
+  // Pinecone — managed vector store for Train AI Doctor RAG retrieval (Crop Doctor
+  // grounding). Vectors are Gemini embeddings; Pinecone replaces in-memory cosine
+  // search so retrieval scales to large training sets. Degrades to Postgres/in-memory
+  // cosine when the API key is unset.
+  pinecone: {
+    apiKey: optional('PINECONE_API_KEY', ''),
+    indexName: optional('PINECONE_INDEX', 'crop-doctor'),
+    // Serverless spec used when auto-creating the index on first use.
+    cloud: optional('PINECONE_CLOUD', 'aws'),
+    region: optional('PINECONE_REGION', 'us-east-1'),
+    namespace: optional('PINECONE_NAMESPACE', 'training'),
   },
 };

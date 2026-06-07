@@ -50,7 +50,7 @@ npm install
 npm run db:setup
 npm run db:seed               # admin@agroerp.example / Admin@123 (+ demo users & branches)
 
-npm run dev                   # nodemon → http://localhost:4000  (GraphiQL at /graphiql)
+npm run dev                   # nodemon → http:.//localhost:4000  (GraphiQL at /graphiql)
 ```
 
 > `npm run dev` uses **nodemon** (config in [`nodemon.json`](./nodemon.json)) — it watches `src/` and restarts on change.
