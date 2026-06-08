@@ -3,6 +3,7 @@
 // AI Crop Doctor & Smart Advisory screens work without an API key.
 
 import { env } from '../../config/env.js';
+import { getDownloadUrl } from '../../utils/aws.js';
 
 const KEY = env.ai?.geminiApiKey || process.env.GEMINI_API_KEY || '';
 const MODEL = env.ai?.geminiModel || 'gemini-2.5-flash';
@@ -97,7 +98,13 @@ async function toInlineData(url) {
   if (!url) return null;
   const dataMatch = /^data:(image\/[a-zA-Z+.-]+);base64,(.+)$/.exec(url);
   if (dataMatch) return { base64: dataMatch[2], mime: dataMatch[1] };
-  const res = await fetch(url);
+  // A bare S3 key (no scheme) — resolve to a signed download URL the backend can
+  // fetch even when the bucket isn't public. (Fixes farmer-app photo diagnosis.)
+  let fetchUrl = url;
+  if (!/^https?:\/\//i.test(url)) {
+    try { fetchUrl = await getDownloadUrl(url); } catch { /* fall back to raw */ }
+  }
+  const res = await fetch(fetchUrl);
   if (!res.ok) throw new Error(`image ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
   return { base64: buf.toString('base64'), mime: res.headers.get('content-type') || 'image/jpeg' };

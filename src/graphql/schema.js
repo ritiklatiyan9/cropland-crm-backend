@@ -31,6 +31,7 @@ import { whatsappTypeDefs } from './modules/whatsapp.js';
 import { farmerAppTypeDefs } from './modules/farmerApp.js';
 import { enquiryTypeDefs } from './modules/enquiries.js';
 import { redemptionTypeDefs } from './modules/redemptions.js';
+import { translateTypeDefs } from './modules/translate.js';
 
 const baseTypeDefs = /* GraphQL */ `
   scalar DateTime
@@ -74,4 +75,5 @@ export const schema = [
   farmerAppTypeDefs,
   enquiryTypeDefs,
   redemptionTypeDefs,
+  translateTypeDefs,
 ].join('\n');

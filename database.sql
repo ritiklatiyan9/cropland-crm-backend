@@ -649,6 +649,18 @@ CREATE TABLE IF NOT EXISTS translations (
 );
 CREATE INDEX IF NOT EXISTS idx_translations_key ON translations(str_key);
 
+-- Machine-translation cache: dynamic DATA strings (product names, advisories,
+-- crop/disease, weather…) translated once via Gemini, then served from here.
+CREATE TABLE IF NOT EXISTS mt_cache (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  source_hash  TEXT NOT NULL,            -- sha256(source_text)
+  lang_code    TEXT NOT NULL,
+  source_text  TEXT NOT NULL,
+  translated   TEXT NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (source_hash, lang_code)
+);
+
 -- Seed the 9 Indian languages + English (PRD §9.2).
 INSERT INTO app_languages (code, name, native_name, is_default, sort_order) VALUES
   ('en','English','English',TRUE,0),

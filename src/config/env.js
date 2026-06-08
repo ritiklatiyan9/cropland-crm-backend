@@ -68,6 +68,8 @@ export const env = {
 
   // Firebase Cloud Messaging — Farmer App push (service-account credentials).
   fcm: {
+    // Path to a downloaded service-account JSON (recommended — avoids newline escaping).
+    serviceAccountFile: optional('FIREBASE_SERVICE_ACCOUNT', ''),
     projectId: optional('FIREBASE_PROJECT_ID', ''),
     clientEmail: optional('FIREBASE_CLIENT_EMAIL', ''),
     // Private key carries literal \n in env; restore real newlines.

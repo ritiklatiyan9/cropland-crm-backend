@@ -8,3 +8,5 @@ coverage/
 .DS_Store
 .idea/
 .vscode/
+*firebase*adminsdk*.json
+cropland-agritech-firebase-adminsdk-fbsvc-b2132d4a3e.json

@@ -1,6 +1,6 @@
 {
-  "watch": ["src"],
-  "ext": "js,json",
+  "watch": ["src", ".env"],
+  "ext": "js,json,env",
   "ignore": ["src/**/*.test.js"],
   "exec": "node --env-file=.env src/server.js",
   "env": {

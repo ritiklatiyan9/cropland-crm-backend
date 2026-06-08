@@ -28,6 +28,7 @@ import { whatsappResolvers } from './modules/whatsapp.js';
 import { farmerAppResolvers } from './modules/farmerApp.js';
 import { enquiryResolvers } from './modules/enquiries.js';
 import { redemptionResolvers } from './modules/redemptions.js';
+import { translateResolvers } from './modules/translate.js';
 
 const DateTime = new GraphQLScalarType({
   name: 'DateTime',
@@ -100,5 +101,6 @@ export function buildResolvers(app) {
     farmerAppResolvers(app),
     enquiryResolvers(app),
     redemptionResolvers(app),
+    translateResolvers(app),
   ]);
 }
