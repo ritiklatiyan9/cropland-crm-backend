@@ -33,6 +33,7 @@ import { distributorAppTypeDefs } from './modules/distributorApp.js';
 import { enquiryTypeDefs } from './modules/enquiries.js';
 import { redemptionTypeDefs } from './modules/redemptions.js';
 import { translateTypeDefs } from './modules/translate.js';
+import { financialsTypeDefs } from './modules/financials.js';
 
 const baseTypeDefs = /* GraphQL */ `
   scalar DateTime
@@ -78,4 +79,5 @@ export const schema = [
   enquiryTypeDefs,
   redemptionTypeDefs,
   translateTypeDefs,
+  financialsTypeDefs,
 ].join('\n');
