@@ -1244,6 +1244,39 @@ CREATE TABLE IF NOT EXISTS distributor_sale_lines (
 );
 CREATE INDEX IF NOT EXISTS idx_distsale_lines ON distributor_sale_lines(sale_id);
 
+-- ─────────────────────────────────────────────────────────────
+-- FINANCIAL STATEMENTS — manual adjustments ledger.
+-- The Balance Sheet / Profit & Loss module derives most figures live from the
+-- commerce tables (sales, purchases, stock, GST, debtors, creditors). This one
+-- table records the accounts the transactional schema does NOT track — operating
+-- expenses, other income, capital, drawings, loans, fixed assets + depreciation,
+-- provisions, cash/bank balances, opening balances — so the statements are fully
+-- populated from real data (no hardcoded figures). One generic row shape covers
+-- every section; `meta` holds schedule sub-fields (fixed-asset opening/addition/
+-- depreciation, bank account no, etc.). The Notes/CA-attestation block is stored
+-- as a single (statement='BS', section='NOTE') row whose text lives in `meta`.
+-- ─────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS financial_ledger_entries (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  entry_date  DATE NOT NULL DEFAULT CURRENT_DATE,    -- posting date (period filter)
+  statement   TEXT NOT NULL,                          -- TRADING | PL | BS
+  section     TEXT NOT NULL,                          -- DIRECT_EXPENSE|INDIRECT_EXPENSE|OTHER_INCOME|
+                                                       -- CAPITAL|UNSECURED_LOAN|CURRENT_LIABILITY|PROVISION|
+                                                       -- FIXED_ASSET|BANK|CASH|LOAN_ADVANCE|OTHER_ASSET|
+                                                       -- OTHER_LIABILITY|OPENING_STOCK|NOTE
+  label       TEXT NOT NULL,                          -- line label as shown on the statement
+  amount      NUMERIC(14,2) NOT NULL DEFAULT 0,       -- closing value for the line
+  meta        JSONB NOT NULL DEFAULT '{}'::jsonb,     -- {opening,addition,depreciation,rate,accountNo,policies,...}
+  is_gst      BOOLEAN NOT NULL DEFAULT TRUE,          -- honoured by the GST-only filter
+  notes       TEXT,
+  created_by  UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_fle_date ON financial_ledger_entries(entry_date);
+CREATE INDEX IF NOT EXISTS idx_fle_section ON financial_ledger_entries(statement, section);
+
 -- ============================================================================
--- End of schema (… + geo/enquiries + loyalty redemption + distributor app)
+-- End of schema (… + geo/enquiries + loyalty redemption + distributor app
+--                + financial statements adjustments ledger)
 -- ============================================================================

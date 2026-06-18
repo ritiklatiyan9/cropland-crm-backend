@@ -30,6 +30,7 @@ import { distributorAppResolvers } from './modules/distributorApp.js';
 import { enquiryResolvers } from './modules/enquiries.js';
 import { redemptionResolvers } from './modules/redemptions.js';
 import { translateResolvers } from './modules/translate.js';
+import { financialsResolvers } from './modules/financials.js';
 
 const DateTime = new GraphQLScalarType({
   name: 'DateTime',
@@ -104,5 +105,6 @@ export function buildResolvers(app) {
     enquiryResolvers(app),
     redemptionResolvers(app),
     translateResolvers(app),
+    financialsResolvers(app),
   ]);
 }

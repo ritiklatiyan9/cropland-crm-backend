@@ -18,6 +18,7 @@ import { buildContext } from './graphql/context.js';
 import { requestStore } from './utils/requestContext.js';
 import healthRoutes from './routes/health.js';
 import uploadRoutes from './routes/uploads.js';
+import reportRoutes from './routes/reports.js';
 import { startAuditCleanup } from './jobs/auditCleanup.js';
 
 export async function buildApp() {
@@ -61,6 +62,7 @@ export async function buildApp() {
   // ── REST routes ────────────────────────────────────────────
   await app.register(healthRoutes);
   await app.register(uploadRoutes);
+  await app.register(reportRoutes);
 
   app.get('/', async () => ({
     name: 'AgroERP Backend CRM',
