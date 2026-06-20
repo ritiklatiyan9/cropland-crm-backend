@@ -129,6 +129,57 @@ export const orderTypeDefs = /* GraphQL */ `
     count: Int!
   }
 
+  "All period-scoped dashboard metrics for the selected window (week / month / year to date)."
+  type DashboardStats {
+    sales: Float!
+    ordersCount: Int!
+    purchases: Float!
+    salesReturnsValue: Float!
+    purchaseReturnsValue: Float!
+    newFarmers: Int!
+    newDistributors: Int!
+    aiSessions: Int!
+    aiLeads: Int!
+    aiConverted: Int!
+    complaintsOpened: Int!
+    ordersByStatus: [StatusCount!]!
+    trend: [MonthlySales!]!
+  }
+
+  "A single sale/transaction row for the unified Sales register (distributor + farmer, GST + non-GST)."
+  type SalesTxn {
+    id: ID!
+    orderNo: String!
+    customerName: String!
+    customerType: String!
+    billType: String!
+    status: String!
+    orderDate: String!
+    itemCount: Int!
+    totalAmount: Float!
+    amountPaid: Float!
+    balanceDue: Float!
+    invoiceId: ID
+  }
+
+  "Paginated slice of the Sales register plus the total row count for the active filters."
+  type SalesPage {
+    rows: [SalesTxn!]!
+    total: Int!
+  }
+
+  "Aggregate KPIs over the full filtered Sales register (excludes cancelled from money totals)."
+  type SalesAnalytics {
+    totalSales: Float!
+    txnCount: Int!
+    gstSales: Float!
+    nonGstSales: Float!
+    distributorSales: Float!
+    farmerSales: Float!
+    collected: Float!
+    outstanding: Float!
+  }
+
   input OrderLineInput {
     productId: ID!
     quantity: Float!
@@ -182,8 +233,11 @@ export const orderTypeDefs = /* GraphQL */ `
     invoices(distributorId: ID, limit: Int = 50, offset: Int = 0): [Invoice!]!
     invoice(id: ID!): Invoice
     salesStats: SalesStats!
-    salesTrend(months: Int = 6): [MonthlySales!]!
+    salesTrend(months: Int = 6, period: String = "MONTHLY"): [MonthlySales!]!
     orderStatusCounts: [StatusCount!]!
+    dashboardStats(period: String = "MONTHLY"): DashboardStats!
+    salesTransactions(search: String, billType: String, customerType: String, status: String, dateFrom: String, dateTo: String, limit: Int = 10, offset: Int = 0): SalesPage!
+    salesAnalytics(search: String, billType: String, customerType: String, status: String, dateFrom: String, dateTo: String): SalesAnalytics!
   }
 
   extend type Mutation {
@@ -299,6 +353,53 @@ function financialYear(dateStr) {
   return `${start}-${String((start + 1) % 100).padStart(2, '0')}`;
 }
 
+// date_trunc unit for the week/month/year-to-date window used by the KPI cards.
+const PERIOD_UNIT = { WEEKLY: 'week', MONTHLY: 'month', YEARLY: 'year' };
+const periodUnit = (period) => PERIOD_UNIT[String(period || 'MONTHLY').toUpperCase()] ?? 'month';
+
+// Time-series buckets for the Sales Trend chart (last N weeks / months / years).
+async function salesTrendRows(period, months) {
+  const PERIODS = {
+    WEEKLY: { unit: 'week', count: 12, fmt: 'DD Mon' },
+    MONTHLY: { unit: 'month', count: months ?? 6, fmt: 'Mon' },
+    YEARLY: { unit: 'year', count: 5, fmt: 'YYYY' },
+  };
+  const cfg = PERIODS[String(period || 'MONTHLY').toUpperCase()] ?? PERIODS.MONTHLY;
+  const { rows } = await query(
+    `WITH buckets AS (
+       SELECT date_trunc($2, CURRENT_DATE) - (n || ' ' || $2)::interval AS m
+       FROM generate_series($1 - 1, 0, -1) AS n
+     )
+     SELECT to_char(buckets.m, $3) AS label,
+            COALESCE(SUM(o.total_amount), 0) AS total
+     FROM buckets
+     LEFT JOIN orders o
+       ON date_trunc($2, o.order_date) = buckets.m AND o.status <> 'CANCELLED'
+     GROUP BY buckets.m ORDER BY buckets.m`,
+    [cfg.count, cfg.unit, cfg.fmt],
+  );
+  return rows.map((r) => ({ label: r.label.trim(), total: num(r.total) }));
+}
+
+// Shared WHERE builder for the Sales register (used by both the paginated list
+// and the analytics aggregate so they always describe the same set of rows).
+// Assumes the query aliases orders o, distributors d, farmers f.
+function buildSalesFilter(a = {}) {
+  const params = [];
+  const cond = [];
+  if (a.search) {
+    params.push(a.search);
+    const p = `$${params.length}`;
+    cond.push(`(o.order_no ILIKE '%' || ${p} || '%' OR d.name ILIKE '%' || ${p} || '%' OR f.name ILIKE '%' || ${p} || '%')`);
+  }
+  if (a.billType && a.billType !== 'ALL') { params.push(a.billType); cond.push(`o.bill_type = $${params.length}`); }
+  if (a.customerType && a.customerType !== 'ALL') { params.push(a.customerType); cond.push(`COALESCE(o.customer_type, 'DISTRIBUTOR') = $${params.length}`); }
+  if (a.status && a.status !== 'ALL') { params.push(a.status); cond.push(`o.status = $${params.length}::order_status`); }
+  if (a.dateFrom) { params.push(a.dateFrom); cond.push(`o.order_date >= $${params.length}::date`); }
+  if (a.dateTo) { params.push(a.dateTo); cond.push(`o.order_date <= $${params.length}::date`); }
+  return { where: cond.length ? `WHERE ${cond.join(' AND ')}` : '', params };
+}
+
 export function orderResolvers() {
   return {
     Query: {
@@ -355,27 +456,139 @@ export function orderResolvers() {
           outstandingTotal: num(rows[0].outstanding_total),
         };
       },
-      salesTrend: async (_p, { months }, ctx) => {
+      salesTrend: async (_p, { months, period }, ctx) => {
         assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
-        const { rows } = await query(
-          `WITH months AS (
-             SELECT date_trunc('month', CURRENT_DATE) - (n || ' months')::interval AS m
-             FROM generate_series($1 - 1, 0, -1) AS n
-           )
-           SELECT to_char(months.m, 'Mon') AS label,
-                  COALESCE(SUM(o.total_amount), 0) AS total
-           FROM months
-           LEFT JOIN orders o
-             ON date_trunc('month', o.order_date) = months.m AND o.status <> 'CANCELLED'
-           GROUP BY months.m ORDER BY months.m`,
-          [months],
-        );
-        return rows.map((r) => ({ label: r.label, total: num(r.total) }));
+        return salesTrendRows(period, months);
       },
       orderStatusCounts: async (_p, _a, ctx) => {
         assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const { rows } = await query('SELECT status, COUNT(*)::int AS count FROM orders GROUP BY status ORDER BY status');
         return rows.map((r) => ({ status: r.status, count: r.count }));
+      },
+      // Every period-scoped dashboard metric in one round-trip. The window is the
+      // selected unit "to date" (this week / this month / this year), so the cards
+      // update together the moment the filter changes.
+      dashboardStats: async (_p, { period }, ctx) => {
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        const unit = periodUnit(period);
+        const [agg, statusRows, trend] = await Promise.all([
+          query(
+            `WITH win AS (SELECT date_trunc($1, CURRENT_DATE)::date AS start)
+             SELECT
+               COALESCE((SELECT SUM(total_amount) FROM orders, win WHERE status <> 'CANCELLED' AND order_date >= win.start), 0) AS sales,
+               (SELECT COUNT(*) FROM orders, win WHERE status <> 'CANCELLED' AND order_date >= win.start)::int AS orders_count,
+               COALESCE((SELECT SUM(total_amount) FROM purchase_invoices, win WHERE invoice_date >= win.start), 0) AS purchases,
+               COALESCE((SELECT SUM(total_amount) FROM sales_returns, win WHERE status = 'APPROVED' AND return_date >= win.start), 0) AS sales_returns_value,
+               COALESCE((SELECT SUM(total_amount) FROM purchase_returns, win WHERE status = 'APPROVED' AND return_date >= win.start), 0) AS purchase_returns_value,
+               (SELECT COUNT(*) FROM farmers, win WHERE created_at >= win.start)::int AS new_farmers,
+               (SELECT COUNT(*) FROM distributors, win WHERE created_at >= win.start)::int AS new_distributors,
+               (SELECT COUNT(*) FROM crop_diagnoses, win WHERE created_at >= win.start)::int AS ai_sessions,
+               (SELECT COUNT(*) FROM crm_leads, win WHERE created_at >= win.start)::int AS ai_leads,
+               (SELECT COUNT(*) FROM crm_leads, win WHERE status = 'CONVERTED' AND created_at >= win.start)::int AS ai_converted,
+               (SELECT COUNT(*) FROM complaints, win WHERE created_at >= win.start)::int AS complaints_opened`,
+            [unit],
+          ),
+          query(
+            `SELECT status, COUNT(*)::int AS count FROM orders
+             WHERE order_date >= date_trunc($1, CURRENT_DATE) GROUP BY status ORDER BY status`,
+            [unit],
+          ),
+          salesTrendRows(period),
+        ]);
+        const r = agg.rows[0];
+        return {
+          sales: num(r.sales),
+          ordersCount: r.orders_count,
+          purchases: num(r.purchases),
+          salesReturnsValue: num(r.sales_returns_value),
+          purchaseReturnsValue: num(r.purchase_returns_value),
+          newFarmers: r.new_farmers,
+          newDistributors: r.new_distributors,
+          aiSessions: r.ai_sessions,
+          aiLeads: r.ai_leads,
+          aiConverted: r.ai_converted,
+          complaintsOpened: r.complaints_opened,
+          ordersByStatus: statusRows.rows.map((s) => ({ status: s.status, count: s.count })),
+          trend,
+        };
+      },
+      // Unified, paginated Sales register across distributor + farmer customers and
+      // GST + non-GST bills. COUNT(*) OVER() returns the full filtered total in the
+      // same round-trip so the UI can paginate without a second count query.
+      salesTransactions: async (_p, args, ctx) => {
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        const { where, params } = buildSalesFilter(args);
+        // Cap is high enough to back a full "print register" export, not just a page.
+        const limit = Math.min(Math.max(args.limit ?? 10, 1), 2000);
+        const offset = Math.max(args.offset ?? 0, 0);
+        const { rows } = await query(
+          `SELECT o.id, o.order_no, COALESCE(o.customer_type, 'DISTRIBUTOR') AS customer_type,
+                  o.bill_type, o.status, o.order_date, o.total_amount,
+                  COALESCE(d.name, f.name, '—') AS customer_name,
+                  COALESCE(i.amount_paid, 0) AS amount_paid,
+                  i.id AS invoice_id,
+                  (SELECT COUNT(*) FROM order_lines ol WHERE ol.order_id = o.id)::int AS item_count,
+                  COUNT(*) OVER()::int AS total_count
+           FROM orders o
+           LEFT JOIN distributors d ON d.id = o.distributor_id
+           LEFT JOIN farmers f ON f.id = o.farmer_id
+           LEFT JOIN invoices i ON i.order_id = o.id
+           ${where}
+           ORDER BY o.order_date DESC, o.created_at DESC
+           LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+          [...params, limit, offset],
+        );
+        return {
+          total: rows[0] ? rows[0].total_count : 0,
+          rows: rows.map((r) => ({
+            id: r.id,
+            orderNo: r.order_no,
+            customerName: r.customer_name,
+            customerType: r.customer_type,
+            billType: r.bill_type,
+            status: r.status,
+            orderDate: isoDate(r.order_date),
+            itemCount: r.item_count,
+            totalAmount: num(r.total_amount),
+            amountPaid: num(r.amount_paid),
+            balanceDue: round2(num(r.total_amount) - num(r.amount_paid)),
+            invoiceId: r.invoice_id ?? null,
+          })),
+        };
+      },
+      // Aggregate KPIs over the whole filtered register (money figures exclude cancelled).
+      salesAnalytics: async (_p, args, ctx) => {
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        const { where, params } = buildSalesFilter(args);
+        const w = where ? `${where} AND o.status <> 'CANCELLED'` : `WHERE o.status <> 'CANCELLED'`;
+        const { rows } = await query(
+          `SELECT
+             COALESCE(SUM(o.total_amount), 0) AS total_sales,
+             COUNT(*)::int AS txn_count,
+             COALESCE(SUM(o.total_amount) FILTER (WHERE o.bill_type = 'GST'), 0) AS gst_sales,
+             COALESCE(SUM(o.total_amount) FILTER (WHERE o.bill_type = 'NON_GST'), 0) AS non_gst_sales,
+             COALESCE(SUM(o.total_amount) FILTER (WHERE COALESCE(o.customer_type, 'DISTRIBUTOR') = 'DISTRIBUTOR'), 0) AS distributor_sales,
+             COALESCE(SUM(o.total_amount) FILTER (WHERE o.customer_type = 'FARMER'), 0) AS farmer_sales,
+             COALESCE(SUM(COALESCE(i.amount_paid, 0)), 0) AS collected,
+             COALESCE(SUM(o.total_amount - COALESCE(i.amount_paid, 0)), 0) AS outstanding
+           FROM orders o
+           LEFT JOIN distributors d ON d.id = o.distributor_id
+           LEFT JOIN farmers f ON f.id = o.farmer_id
+           LEFT JOIN invoices i ON i.order_id = o.id
+           ${w}`,
+          params,
+        );
+        const r = rows[0];
+        return {
+          totalSales: num(r.total_sales),
+          txnCount: r.txn_count,
+          gstSales: num(r.gst_sales),
+          nonGstSales: num(r.non_gst_sales),
+          distributorSales: num(r.distributor_sales),
+          farmerSales: num(r.farmer_sales),
+          collected: num(r.collected),
+          outstanding: num(r.outstanding),
+        };
       },
     },
 
