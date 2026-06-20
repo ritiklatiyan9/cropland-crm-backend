@@ -1104,6 +1104,25 @@ ALTER TABLE payments ADD COLUMN IF NOT EXISTS farmer_id UUID REFERENCES farmers(
 ALTER TABLE payments ALTER COLUMN distributor_id DROP NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_orders_farmer ON orders(farmer_id);
 
+-- ── Transport & logistics details (printed on GST + Non-GST invoices/bills) ──
+-- Captured at order time and editable later (e.g. at dispatch). `delivery_address`
+-- already exists above. Invoices inherit these from their parent order.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS transport_name    TEXT;          -- carrier / "Transport"
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS transporter_id    TEXT;          -- GST transporter ID
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS vehicle_no        TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS driver_name       TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS driver_mobile     TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS lr_number         TEXT;          -- LR / GR-RR No.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS lr_date           DATE;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS dispatch_date     DATE;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_location TEXT;          -- destination station/city
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS eway_bill_no      TEXT;          -- manual E-Way Bill No. (GST)
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS num_packages      INTEGER;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_weight      TEXT;          -- free-text to allow units (e.g. "190 Kg")
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS freight_charges   NUMERIC(14,2);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS freight_type      TEXT;          -- PAID / TO_PAY
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS dispatch_through  TEXT;
+
 -- ─────────────────────────────────────────────────────────────
 -- WHATSAPP CAMPAIGN CONSOLE (Phase 4) — broadcast product cards / advisories /
 -- offers to farmers & distributors. Provider-abstracted (Meta Cloud API / mock).
