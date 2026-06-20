@@ -33,6 +33,26 @@ export const orderTypeDefs = /* GraphQL */ `
     phone: String
   }
 
+  # Transport & logistics block printed on both GST invoices and Non-GST bills.
+  type OrderTransport {
+    transportName: String
+    transporterId: String
+    vehicleNo: String
+    driverName: String
+    driverMobile: String
+    lrNumber: String
+    lrDate: String
+    dispatchDate: String
+    deliveryLocation: String
+    deliveryAddress: String
+    ewayBillNo: String
+    numPackages: Int
+    totalWeight: String
+    freightCharges: Float
+    freightType: String
+    dispatchThrough: String
+  }
+
   type Order {
     id: ID!
     orderNo: String!
@@ -50,6 +70,7 @@ export const orderTypeDefs = /* GraphQL */ `
     totalAmount: Float!
     notes: String
     deliveryAddress: String
+    transport: OrderTransport
     itemCount: Int!
     lines: [OrderLine!]!
     invoice: Invoice
@@ -78,6 +99,7 @@ export const orderTypeDefs = /* GraphQL */ `
     balanceDue: Float!
     irn: String
     ewayBillNo: String
+    transport: OrderTransport
     status: String!
     createdAt: DateTime!
   }
@@ -114,6 +136,25 @@ export const orderTypeDefs = /* GraphQL */ `
     discountPct: Float = 0
   }
 
+  input OrderTransportInput {
+    transportName: String
+    transporterId: String
+    vehicleNo: String
+    driverName: String
+    driverMobile: String
+    lrNumber: String
+    lrDate: String
+    dispatchDate: String
+    deliveryLocation: String
+    deliveryAddress: String
+    ewayBillNo: String
+    numPackages: Int
+    totalWeight: String
+    freightCharges: Float
+    freightType: String
+    dispatchThrough: String
+  }
+
   input CreateOrderInput {
     distributorId: ID
     customerType: String   # DISTRIBUTOR (default) or FARMER
@@ -123,6 +164,7 @@ export const orderTypeDefs = /* GraphQL */ `
     orderDate: String
     notes: String
     deliveryAddress: String
+    transport: OrderTransportInput
     discountAmount: Float = 0   # bill-level discount in ₹ (UI offers % or ₹; resolved to ₹ here)
     lines: [OrderLineInput!]!
   }
@@ -146,6 +188,7 @@ export const orderTypeDefs = /* GraphQL */ `
 
   extend type Mutation {
     createOrder(input: CreateOrderInput!): Order!
+    updateOrderTransport(orderId: ID!, input: OrderTransportInput!): Order!
     approveOrder(id: ID!): Order!
     generateInvoice(orderId: ID!): Invoice!
     recordPayment(input: PaymentInput!): Payment!
@@ -168,6 +211,28 @@ const mapLine = (r) => ({
   taxAmount: Math.round(num(r.line_total) * num(r.gst_percent)) / 100,
 });
 
+// Transport & logistics snapshot from an orders row (columns may be NULL on
+// older orders — every field is nullable, so backward-compatible).
+const mapTransport = (r) =>
+  r && {
+    transportName: r.transport_name ?? null,
+    transporterId: r.transporter_id ?? null,
+    vehicleNo: r.vehicle_no ?? null,
+    driverName: r.driver_name ?? null,
+    driverMobile: r.driver_mobile ?? null,
+    lrNumber: r.lr_number ?? null,
+    lrDate: r.lr_date ? isoDate(r.lr_date) : null,
+    dispatchDate: r.dispatch_date ? isoDate(r.dispatch_date) : null,
+    deliveryLocation: r.delivery_location ?? null,
+    deliveryAddress: r.delivery_address ?? null,
+    ewayBillNo: r.eway_bill_no ?? null,
+    numPackages: r.num_packages ?? null,
+    totalWeight: r.total_weight ?? null,
+    freightCharges: r.freight_charges == null ? null : num(r.freight_charges),
+    freightType: r.freight_type ?? null,
+    dispatchThrough: r.dispatch_through ?? null,
+  };
+
 const mapOrder = (r) =>
   r && {
     id: r.id,
@@ -184,6 +249,7 @@ const mapOrder = (r) =>
     totalAmount: num(r.total_amount),
     notes: r.notes,
     deliveryAddress: r.delivery_address,
+    transport: mapTransport(r),
     createdAt: r.created_at,
   };
 
@@ -359,10 +425,20 @@ export function orderResolvers() {
             (await client.query("SELECT nextval('order_seq') AS n")).rows[0].n,
           ).padStart(5, '0')}`;
 
+          // Transport & logistics (optional) — delivery address falls back to the legacy top-level field.
+          const t = input.transport ?? {};
+          const deliveryAddress = t.deliveryAddress ?? input.deliveryAddress ?? null;
           const ord = await client.query(
-            `INSERT INTO orders (order_no, distributor_id, farmer_id, customer_type, farmer_ref, bill_type, status, order_date, sub_total, discount_total, tax_total, total_amount, notes, delivery_address, created_by)
-             VALUES ($1,$2,$3,$4,$5,$6,'PLACED',COALESCE($7,CURRENT_DATE),$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
-            [orderNo, distributorId, farmerId, customerType, input.farmerRef?.trim() || null, billType, input.orderDate ?? null, subTotal, discountTotal, taxTotal, total, input.notes ?? null, input.deliveryAddress ?? null, actor.sub],
+            `INSERT INTO orders (
+               order_no, distributor_id, farmer_id, customer_type, farmer_ref, bill_type, status, order_date,
+               sub_total, discount_total, tax_total, total_amount, notes, delivery_address, created_by,
+               transport_name, transporter_id, vehicle_no, driver_name, driver_mobile, lr_number, lr_date,
+               dispatch_date, delivery_location, eway_bill_no, num_packages, total_weight, freight_charges,
+               freight_type, dispatch_through)
+             VALUES ($1,$2,$3,$4,$5,$6,'PLACED',COALESCE($7,CURRENT_DATE),$8,$9,$10,$11,$12,$13,$14,
+               $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29) RETURNING *`,
+            [orderNo, distributorId, farmerId, customerType, input.farmerRef?.trim() || null, billType, input.orderDate ?? null, subTotal, discountTotal, taxTotal, total, input.notes ?? null, deliveryAddress, actor.sub,
+             t.transportName ?? null, t.transporterId ?? null, t.vehicleNo ?? null, t.driverName ?? null, t.driverMobile ?? null, t.lrNumber ?? null, t.lrDate ?? null, t.dispatchDate ?? null, t.deliveryLocation ?? null, t.ewayBillNo ?? null, t.numPackages ?? null, t.totalWeight ?? null, t.freightCharges ?? null, t.freightType ?? null, t.dispatchThrough ?? null],
           );
           const orderId = ord.rows[0].id;
 
@@ -391,6 +467,29 @@ export function orderResolvers() {
           await logActivity(actor.sub, 'CREATE_ORDER', 'order', orderId, { orderNo });
           return mapOrder(ord.rows[0]);
         });
+      },
+
+      // Add or edit the transport & logistics block on an existing order. Used by
+      // the order workspace (e.g. when filling dispatch details). Does not touch totals.
+      updateOrderTransport: async (_p, { orderId, input }, ctx) => {
+        const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        const t = input ?? {};
+        const { rows } = await query(
+          `UPDATE orders SET
+             transport_name=$2, transporter_id=$3, vehicle_no=$4, driver_name=$5, driver_mobile=$6,
+             lr_number=$7, lr_date=$8, dispatch_date=$9, delivery_location=$10,
+             delivery_address=COALESCE($11, delivery_address), eway_bill_no=$12,
+             num_packages=$13, total_weight=$14, freight_charges=$15, freight_type=$16,
+             dispatch_through=$17, updated_at=now()
+           WHERE id=$1 RETURNING *`,
+          [orderId, t.transportName ?? null, t.transporterId ?? null, t.vehicleNo ?? null, t.driverName ?? null,
+           t.driverMobile ?? null, t.lrNumber ?? null, t.lrDate ?? null, t.dispatchDate ?? null, t.deliveryLocation ?? null,
+           t.deliveryAddress ?? null, t.ewayBillNo ?? null, t.numPackages ?? null, t.totalWeight ?? null,
+           t.freightCharges ?? null, t.freightType ?? null, t.dispatchThrough ?? null],
+        );
+        if (!rows[0]) throw httpError('Order not found', 404);
+        await logActivity(actor.sub, 'UPDATE_ORDER_TRANSPORT', 'order', orderId);
+        return mapOrder(rows[0]);
       },
 
       approveOrder: async (_p, { id }, ctx) => {
@@ -569,6 +668,11 @@ export function orderResolvers() {
       order: async (parent) => {
         const { rows } = await query('SELECT * FROM orders WHERE id = $1', [parent.orderId]);
         return mapOrder(rows[0]);
+      },
+      // Transport block is inherited from the invoice's parent order.
+      transport: async (parent) => {
+        const { rows } = await query('SELECT * FROM orders WHERE id = $1', [parent.orderId]);
+        return rows[0] ? mapTransport(rows[0]) : null;
       },
       distributor: async (parent) => {
         if (!parent.distributorId) return null;
