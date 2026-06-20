@@ -23,6 +23,6 @@ export function assertAuth(context) {
 /** Throw if the authenticated user is not in `roles`. */
 export function assertRole(context, ...roles) {
   const user = assertAuth(context);
-  if (!roles.includes(user.role)) throw new Error('Forbidden: insufficient role');
+  if (!roles.includes(user.role)) throw new Error('Forbidden: insufficient role available');
   return user;
 }
