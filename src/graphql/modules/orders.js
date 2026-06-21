@@ -74,7 +74,34 @@ export const orderTypeDefs = /* GraphQL */ `
     itemCount: Int!
     lines: [OrderLine!]!
     invoice: Invoice
+    billAddress: BillAddress
     createdAt: DateTime!
+  }
+
+  # Buyer billing details captured (frozen) on the order/bill at generation time.
+  type BillAddress {
+    name: String
+    firmName: String
+    gstin: String
+    address: String
+    city: String
+    district: String
+    state: String
+    pincode: String
+    phone: String
+    shippingAddress: String
+  }
+  input BillAddressInput {
+    name: String
+    firmName: String
+    gstin: String
+    address: String
+    city: String
+    district: String
+    state: String
+    pincode: String
+    phone: String
+    shippingAddress: String
   }
 
   type Invoice {
@@ -85,6 +112,7 @@ export const orderTypeDefs = /* GraphQL */ `
     distributor: Distributor
     customer: Customer
     customerName: String
+    billAddress: BillAddress
     company: CompanySettings
     billType: String!
     invoiceDate: String!
@@ -217,6 +245,8 @@ export const orderTypeDefs = /* GraphQL */ `
     deliveryAddress: String
     transport: OrderTransportInput
     discountAmount: Float = 0   # bill-level discount in ₹ (UI offers % or ₹; resolved to ₹ here)
+    billAddress: BillAddressInput   # optional "Edit Address" override for this bill (else auto-snapshot from party)
+    updateParty: Boolean = false    # also persist the edited address back to the party master
     lines: [OrderLineInput!]!
   }
 
@@ -232,6 +262,8 @@ export const orderTypeDefs = /* GraphQL */ `
     order(id: ID!): Order
     invoices(distributorId: ID, limit: Int = 50, offset: Int = 0): [Invoice!]!
     invoice(id: ID!): Invoice
+    "Current billing-address profile of a party (DISTRIBUTOR | FARMER) — pre-fills the Edit Address form during billing."
+    partyBillingProfile(partyType: String!, partyId: ID!): BillAddress!
     salesStats: SalesStats!
     salesTrend(months: Int = 6, period: String = "MONTHLY"): [MonthlySales!]!
     orderStatusCounts: [StatusCount!]!
@@ -304,8 +336,26 @@ const mapOrder = (r) =>
     notes: r.notes,
     deliveryAddress: r.delivery_address,
     transport: mapTransport(r),
+    billAddress: r.bill_address ?? null,
     createdAt: r.created_at,
   };
+
+// Build the buyer billing snapshot frozen onto a bill. Auto-filled from the party
+// row (distributor or farmer); any non-empty override field wins. Distributors carry
+// GSTIN + address; farmers use village as the address line.
+function buildBillSnapshot(customerType, row, override = {}) {
+  const base = customerType === 'FARMER'
+    ? { name: row.name, firmName: row.name, gstin: null, address: row.village ?? null, city: row.village ?? null, district: row.district ?? null, state: row.state ?? null, pincode: null, phone: row.phone ?? null }
+    : { name: row.name, firmName: row.name, gstin: row.gstin ?? null, address: row.address ?? null, city: row.district ?? null, district: row.district ?? null, state: row.state ?? null, pincode: null, phone: row.phone ?? null };
+  const o = override || {};
+  const pick = (k) => (o[k] != null && o[k] !== '' ? o[k] : base[k]);
+  return {
+    name: pick('name'), firmName: pick('firmName'), gstin: pick('gstin'),
+    address: pick('address'), city: pick('city'), district: pick('district'),
+    state: pick('state'), pincode: pick('pincode'), phone: pick('phone'),
+    shippingAddress: o.shippingAddress != null && o.shippingAddress !== '' ? o.shippingAddress : null,
+  };
+}
 
 const mapInvoice = (r) =>
   r && {
@@ -434,6 +484,14 @@ export function orderResolvers() {
           [distributorId ?? null, limit, offset],
         );
         return rows.map(mapInvoice);
+      },
+      partyBillingProfile: async (_p, { partyType, partyId }, ctx) => {
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        const type = partyType === 'FARMER' ? 'FARMER' : 'DISTRIBUTOR';
+        const table = type === 'FARMER' ? 'farmers' : 'distributors';
+        const { rows } = await query(`SELECT * FROM ${table} WHERE id = $1`, [partyId]);
+        if (!rows[0]) throw httpError('Party not found', 404);
+        return buildBillSnapshot(type, rows[0]);
       },
       invoice: async (_p, { id }, ctx) => {
         assertAuth(ctx);
@@ -602,9 +660,13 @@ export function orderResolvers() {
         if (!customerId) throw httpError('A customer (distributor or farmer) is required', 400);
         return withTransaction(async (client) => {
           const table = customerType === 'FARMER' ? 'farmers' : 'distributors';
-          if (!(await client.query(`SELECT id FROM ${table} WHERE id = $1`, [customerId])).rows[0]) throw httpError(`${customerType === 'FARMER' ? 'Farmer' : 'Distributor'} not found`, 404);
+          const partyRow = (await client.query(`SELECT * FROM ${table} WHERE id = $1`, [customerId])).rows[0];
+          if (!partyRow) throw httpError(`${customerType === 'FARMER' ? 'Farmer' : 'Distributor'} not found`, 404);
           const distributorId = customerType === 'DISTRIBUTOR' ? customerId : null;
           const farmerId = customerType === 'FARMER' ? customerId : null;
+          // Freeze the buyer's billing details onto this order (auto from the party,
+          // or the "Edit Address" override) so historical bills never change later.
+          const billSnap = buildBillSnapshot(customerType, partyRow, input.billAddress);
 
           // Snapshot product data + compute line totals. Non-GST orders carry no tax.
           // Farmers (B2C) are billed at MRP/dealer price; distributors at the distributor price.
@@ -647,13 +709,31 @@ export function orderResolvers() {
                sub_total, discount_total, tax_total, total_amount, notes, delivery_address, created_by,
                transport_name, transporter_id, vehicle_no, driver_name, driver_mobile, lr_number, lr_date,
                dispatch_date, delivery_location, eway_bill_no, num_packages, total_weight, freight_charges,
-               freight_type, dispatch_through)
+               freight_type, dispatch_through, bill_address)
              VALUES ($1,$2,$3,$4,$5,$6,'PLACED',COALESCE($7,CURRENT_DATE),$8,$9,$10,$11,$12,$13,$14,
-               $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29) RETURNING *`,
+               $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30::jsonb) RETURNING *`,
             [orderNo, distributorId, farmerId, customerType, input.farmerRef?.trim() || null, billType, input.orderDate ?? null, subTotal, discountTotal, taxTotal, total, input.notes ?? null, deliveryAddress, actor.sub,
-             t.transportName ?? null, t.transporterId ?? null, t.vehicleNo ?? null, t.driverName ?? null, t.driverMobile ?? null, t.lrNumber ?? null, t.lrDate ?? null, t.dispatchDate ?? null, t.deliveryLocation ?? null, t.ewayBillNo ?? null, t.numPackages ?? null, t.totalWeight ?? null, t.freightCharges ?? null, t.freightType ?? null, t.dispatchThrough ?? null],
+             t.transportName ?? null, t.transporterId ?? null, t.vehicleNo ?? null, t.driverName ?? null, t.driverMobile ?? null, t.lrNumber ?? null, t.lrDate ?? null, t.dispatchDate ?? null, t.deliveryLocation ?? null, t.ewayBillNo ?? null, t.numPackages ?? null, t.totalWeight ?? null, t.freightCharges ?? null, t.freightType ?? null, t.dispatchThrough ?? null, JSON.stringify(billSnap)],
           );
           const orderId = ord.rows[0].id;
+
+          // Optional "Update Party Master": persist the edited billing details back to
+          // the party. Only runs when the user opted in AND an override was supplied.
+          if (input.updateParty && input.billAddress) {
+            if (customerType === 'DISTRIBUTOR') {
+              await client.query(
+                `UPDATE distributors SET name=COALESCE($2,name), gstin=COALESCE($3,gstin), address=COALESCE($4,address),
+                   district=COALESCE($5,district), state=COALESCE($6,state), phone=COALESCE($7,phone), updated_at=now() WHERE id=$1`,
+                [customerId, billSnap.firmName ?? billSnap.name, billSnap.gstin, billSnap.address, billSnap.district, billSnap.state, billSnap.phone],
+              );
+            } else {
+              await client.query(
+                `UPDATE farmers SET name=COALESCE($2,name), phone=COALESCE($3,phone), village=COALESCE($4,village),
+                   district=COALESCE($5,district), state=COALESCE($6,state), updated_at=now() WHERE id=$1`,
+                [customerId, billSnap.name, billSnap.phone, billSnap.address, billSnap.district, billSnap.state],
+              );
+            }
+          }
 
           // Loyalty referral: credit the referenced farmer with coins (₹100 = 1 coin).
           if (input.farmerRef?.trim()) {
@@ -882,10 +962,14 @@ export function orderResolvers() {
         const { rows } = await query('SELECT * FROM orders WHERE id = $1', [parent.orderId]);
         return mapOrder(rows[0]);
       },
-      // Transport block is inherited from the invoice's parent order.
+      // Transport block + billing snapshot are inherited from the parent order.
       transport: async (parent) => {
         const { rows } = await query('SELECT * FROM orders WHERE id = $1', [parent.orderId]);
         return rows[0] ? mapTransport(rows[0]) : null;
+      },
+      billAddress: async (parent) => {
+        const { rows } = await query('SELECT bill_address FROM orders WHERE id = $1', [parent.orderId]);
+        return rows[0]?.bill_address ?? null;
       },
       distributor: async (parent) => {
         if (!parent.distributorId) return null;

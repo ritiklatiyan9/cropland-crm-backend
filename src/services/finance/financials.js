@@ -53,6 +53,8 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
     debtorRows,
     creditorRows,
     ledgerRows,
+    salesListRows,
+    purchListRows,
   ] = await Promise.all([
     query('SELECT * FROM company_settings WHERE id = 1'),
     query(
@@ -122,6 +124,26 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
        WHERE entry_date <= $1 AND (NOT $2 OR is_gst = true) ORDER BY section, label`,
       [to, g],
     ),
+    // All sales transactions in the period — same source as the Trading "By Sales" figure.
+    query(
+      `SELECT i.invoice_no AS ref, i.invoice_date AS dt, COALESCE(d.name, f.name, 'Unknown') AS party,
+              i.taxable_value AS taxable, i.total_amount AS total
+       FROM invoices i
+       LEFT JOIN distributors d ON d.id = i.distributor_id
+       LEFT JOIN farmers f ON f.id = i.farmer_id
+       WHERE i.status <> 'CANCELLED' AND i.invoice_date BETWEEN $1 AND $2 AND (NOT $3 OR i.bill_type = 'GST')
+       ORDER BY i.invoice_date, i.invoice_no`,
+      [from, to, g],
+    ),
+    // All purchase transactions in the period — same source as the Trading "Purchases" figure.
+    query(
+      `SELECT COALESCE(pi.bill_no, pi.internal_no) AS ref, pi.invoice_date AS dt, v.name AS party,
+              pi.taxable_value AS taxable, pi.total_amount AS total
+       FROM purchase_invoices pi JOIN vendors v ON v.id = pi.vendor_id
+       WHERE pi.invoice_date BETWEEN $1 AND $2 AND (NOT $3 OR pi.tax_value > 0)
+       ORDER BY pi.invoice_date, pi.internal_no`,
+      [from, to, g],
+    ),
   ]);
 
   // ── Derived commerce figures ────────────────────────────────
@@ -132,6 +154,12 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
   const outputGst = r2(num(salesRow.rows[0].gst) - num(salesRetRow.rows[0].tax));
   const inputGst = r2(num(purchRow.rows[0].gst) - num(purchRetRow.rows[0].tax));
   const netGst = r2(outputGst - inputGst); // > 0 ⇒ payable, < 0 ⇒ receivable
+
+  // Itemised transaction schedules (surfaced on the Balance Sheet as annexures).
+  const isoDay = (d) => (d == null ? null : typeof d === 'string' ? d.slice(0, 10) : new Date(d).toISOString().slice(0, 10));
+  const toTxns = (rows) => rows.map((r) => ({ date: isoDay(r.dt), refNo: r.ref ?? null, party: r.party, taxable: r2(num(r.taxable)), total: r2(num(r.total)) }));
+  const salesTxns = toTxns(salesListRows.rows);
+  const purchaseTxns = toTxns(purchListRows.rows);
 
   const debtors = debtorRows.rows.filter((r) => num(r.bal) > 0).map((r) => ({ name: r.name, amount: r2(num(r.bal)) })).sort((a, b) => b.amount - a.amount);
   const advances = debtorRows.rows.filter((r) => num(r.bal) < 0).map((r) => ({ name: r.name, amount: r2(-num(r.bal)) })).sort((a, b) => b.amount - a.amount);
@@ -205,6 +233,7 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
   // Build grouped liability + asset sections (each: {group, amount, lines[]}).
   const liabilities = [];
   liabilities.push({ group: 'Capital Account', amount: closingCapital, lines: [...capitalComponents, { label: 'Add: Net Profit / (Loss)', amount: netProfit }] });
+  if ((bsMan.SECURED_LOAN ?? []).length) liabilities.push({ group: 'Secured Loans', amount: sumAmt(bsMan.SECURED_LOAN), lines: toLines(bsMan.SECURED_LOAN) });
   if ((bsMan.UNSECURED_LOAN ?? []).length) liabilities.push({ group: 'Unsecured Loans', amount: sumAmt(bsMan.UNSECURED_LOAN), lines: toLines(bsMan.UNSECURED_LOAN) });
 
   const currentLiab = [];
@@ -273,6 +302,9 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
         advances,
         fixedAssets,
         capital: { lines: capitalComponents, netProfit, closing: closingCapital },
+        stock: { opening: openingStock, closing: closingStock },
+        sales: salesTxns,
+        purchases: purchaseTxns,
       },
       validation: {
         assetsTotal,

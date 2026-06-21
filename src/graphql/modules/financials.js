@@ -35,12 +35,17 @@ export const financialsTypeDefs = /* GraphQL */ `
   }
 
   type BalanceValidation { assetsTotal: Float!, liabilitiesTotal: Float!, difference: Float!, balanced: Boolean! }
+  type StockSummary { opening: Float!, closing: Float! }
+  type TxnRow { date: String!, refNo: String, party: String!, taxable: Float!, total: Float! }
   type Schedules {
     debtors: [NamedAmount!]!
     creditors: [NamedAmount!]!
     advances: [NamedAmount!]!
     fixedAssets: [FixedAssetRow!]!
     capital: CapitalSchedule!
+    stock: StockSummary!
+    sales: [TxnRow!]!
+    purchases: [TxnRow!]!
   }
   type BalanceSheetReport {
     meta: StatementMeta!
@@ -91,7 +96,7 @@ export const financialsTypeDefs = /* GraphQL */ `
 
 const VALID_STATEMENTS = new Set(['TRADING', 'PL', 'BS']);
 const VALID_SECTIONS = new Set([
-  'DIRECT_EXPENSE', 'INDIRECT_EXPENSE', 'OTHER_INCOME', 'CAPITAL', 'UNSECURED_LOAN',
+  'DIRECT_EXPENSE', 'INDIRECT_EXPENSE', 'OTHER_INCOME', 'CAPITAL', 'SECURED_LOAN', 'UNSECURED_LOAN',
   'CURRENT_LIABILITY', 'PROVISION', 'FIXED_ASSET', 'BANK', 'CASH', 'LOAN_ADVANCE',
   'OTHER_ASSET', 'OTHER_LIABILITY', 'OPENING_STOCK', 'NOTE',
 ]);

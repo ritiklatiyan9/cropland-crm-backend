@@ -1123,6 +1123,11 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS freight_charges   NUMERIC(14,2);
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS freight_type      TEXT;          -- PAID / TO_PAY
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS dispatch_through  TEXT;
 
+-- Buyer billing-address snapshot, frozen at order/bill generation. Historical bills
+-- keep the address used at the time even if the party master is edited later.
+-- JSONB: { name, firmName, gstin, address, city, district, state, pincode, phone, shippingAddress }.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS bill_address JSONB;
+
 -- ─────────────────────────────────────────────────────────────
 -- WHATSAPP CAMPAIGN CONSOLE (Phase 4) — broadcast product cards / advisories /
 -- offers to farmers & distributors. Provider-abstracted (Meta Cloud API / mock).

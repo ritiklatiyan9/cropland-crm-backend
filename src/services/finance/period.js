@@ -52,6 +52,12 @@ export function resolvePeriod(reportType, fromDate, toDate) {
     const qEnd = qStart + 2;
     return { reportType: type, from: fmt(y, qStart, 1), to: fmt(y, qEnd, lastDay(y, qEnd)) };
   }
+  if (type === 'HALF_YEARLY') {
+    // Indian FY half-years: H1 = Apr–Sep, H2 = Oct–Mar (spans the calendar boundary).
+    if (m >= 4 && m <= 9) return { reportType: type, from: fmt(y, 4, 1), to: fmt(y, 9, 30) };
+    const h2Start = m >= 10 ? y : y - 1; // Jan–Mar belongs to the H2 that began last Oct
+    return { reportType: type, from: fmt(h2Start, 10, 1), to: fmt(h2Start + 1, 3, 31) };
+  }
   // YEARLY (and CUSTOM with no dates) → Indian financial year containing the ref.
   const fyStart = m >= 4 ? y : y - 1;
   return { reportType: type === 'CUSTOM' ? 'YEARLY' : type, from: fmt(fyStart, 4, 1), to: fmt(fyStart + 1, 3, 31) };

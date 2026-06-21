@@ -46,6 +46,30 @@ export const partyTypeDefs = /* GraphQL */ `
 
   type PartiesStats { total: Int!, distributors: Int!, farmers: Int!, vendors: Int!, receivable: Float!, payable: Float! }
 
+  # Filter-independent header KPIs for the Outstanding view — computed over the FULL
+  # receivables set (every distributor/farmer with a positive balance) so the tiles,
+  # split bar, tab counts and progress-bar scale stay stable while paging or searching.
+  type OutstandingSummary {
+    partiesWithDues: Int!
+    distributorCount: Int!
+    farmerCount: Int!
+    distributorDue: Float!
+    farmerDue: Float!
+    maxBalance: Float!
+  }
+
+  # One page of outstanding receivables + pagination meta + the summary above.
+  type OutstandingPage {
+    data: [Party!]!
+    currentPage: Int!
+    totalPages: Int!
+    totalRecords: Int!
+    limit: Int!
+    hasNextPage: Boolean!
+    hasPrevPage: Boolean!
+    summary: OutstandingSummary!
+  }
+
   type PartySaleLine { id: ID!, productId: ID!, productName: String!, batchNumber: String, quantity: Float!, unitPrice: Float!, gstPercent: Float!, lineTotal: Float! }
   type PartySale {
     id: ID!
@@ -79,6 +103,8 @@ export const partyTypeDefs = /* GraphQL */ `
 
   extend type Query {
     parties(search: String, type: String, limit: Int = 200): [Party!]!
+    "Server-side paginated Outstanding (receivables) list. type = DISTRIBUTOR | FARMER | null (all)."
+    outstandingReceivables(page: Int = 1, limit: Int = 20, type: String, search: String): OutstandingPage!
     partyLedger(partyType: String!, partyId: ID!): PartyLedger!
     partiesStats: PartiesStats!
     partySales(limit: Int = 100): [PartySale!]!
@@ -151,6 +177,80 @@ export function partyResolvers() {
         );
         const r = rows[0];
         return { total: r.distributors + r.vendors + r.farmers, distributors: r.distributors, farmers: r.farmers, vendors: r.vendors, receivable: num(r.receivable), payable: num(r.payable) };
+      },
+
+      // Server-side paginated Outstanding view. Receivables = distributors + farmers
+      // with a positive balance (vendors are PAYABLE, so excluded — also a perf win vs.
+      // the full `parties` union). Returns the requested page slice (largest dues first),
+      // pagination meta, and a filter-independent `summary` so the header tiles / split
+      // bar / tab counts stay stable across pages and searches. The expensive per-party
+      // balance subqueries run once: the `positive` CTE is materialised and reused for
+      // counting, the summary, and the page slice — a single round-trip to the DB.
+      outstandingReceivables: async (_p, args, ctx) => {
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        const type = ['DISTRIBUTOR', 'FARMER'].includes(args.type) ? args.type : null;
+        const search = args.search?.trim() || null;
+        const limit = Math.min(Math.max(args.limit ?? 20, 1), 100);
+        const page = Math.max(args.page ?? 1, 1);
+        const offset = (page - 1) * limit;
+
+        const { rows } = await query(
+          `WITH recv AS (
+             SELECT d.id::text AS id, 'DISTRIBUTOR' AS party_type, d.name, d.phone, d.email, d.gstin, d.state AS location,
+               d.outstanding + COALESCE((SELECT SUM(total_amount-amount_paid) FROM party_sales WHERE distributor_id=d.id),0) AS balance
+             FROM distributors d
+             UNION ALL
+             SELECT f.id::text, 'FARMER', f.name, f.phone, f.email, NULL, COALESCE(f.village, f.district),
+               COALESCE((SELECT SUM(total_amount-amount_paid) FROM party_sales WHERE farmer_id=f.id),0)
+                 + COALESCE((SELECT SUM(total_amount-amount_paid) FROM invoices WHERE farmer_id=f.id),0)
+             FROM farmers f
+           ),
+           positive AS (SELECT * FROM recv WHERE balance > 0),
+           filtered AS (
+             SELECT * FROM positive
+             WHERE ($1::text IS NULL OR party_type = $1)
+               AND ($2::text IS NULL OR name ILIKE '%'||$2||'%' OR phone ILIKE '%'||$2||'%')
+           ),
+           page_rows AS (SELECT * FROM filtered ORDER BY balance DESC, name LIMIT $3 OFFSET $4)
+           SELECT
+             (SELECT COUNT(*) FROM filtered)::int AS total_records,
+             (SELECT row_to_json(s) FROM (
+                SELECT COUNT(*)::int AS parties_with_dues,
+                       COUNT(*) FILTER (WHERE party_type='DISTRIBUTOR')::int AS distributor_count,
+                       COUNT(*) FILTER (WHERE party_type='FARMER')::int AS farmer_count,
+                       COALESCE(SUM(balance) FILTER (WHERE party_type='DISTRIBUTOR'),0) AS distributor_due,
+                       COALESCE(SUM(balance) FILTER (WHERE party_type='FARMER'),0) AS farmer_due,
+                       COALESCE(MAX(balance),0) AS max_balance
+                FROM positive
+              ) s) AS summary,
+             COALESCE((SELECT json_agg(p) FROM page_rows p), '[]'::json) AS data`,
+          [type, search, limit, offset],
+        );
+
+        const r = rows[0];
+        const sm = r.summary;
+        const totalRecords = r.total_records;
+        const totalPages = Math.max(1, Math.ceil(totalRecords / limit));
+        return {
+          data: (r.data ?? []).map((p) => ({
+            id: p.id, partyType: p.party_type, name: p.name, phone: p.phone, email: p.email, gstin: p.gstin,
+            location: p.location, balance: num(p.balance) ?? 0, balanceKind: 'RECEIVABLE', isActive: true,
+          })),
+          currentPage: page,
+          totalPages,
+          totalRecords,
+          limit,
+          hasNextPage: page < totalPages,
+          hasPrevPage: page > 1,
+          summary: {
+            partiesWithDues: sm.parties_with_dues,
+            distributorCount: sm.distributor_count,
+            farmerCount: sm.farmer_count,
+            distributorDue: num(sm.distributor_due),
+            farmerDue: num(sm.farmer_due),
+            maxBalance: num(sm.max_balance),
+          },
+        };
       },
 
       partyLedger: async (_p, { partyType, partyId }, ctx) => {
