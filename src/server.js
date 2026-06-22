@@ -7,7 +7,7 @@ import { env } from './config/env.js';
 const app = await buildApp();
 
 closeWithGrace({ delay: 10_000 }, async ({ err }) => {
-  if (err) app.log.error({ err }, 'shutting down due to error');
+  if (err) app.log.error({ err }, 'shutting down due to error..');
   await app.close();
 });
 
