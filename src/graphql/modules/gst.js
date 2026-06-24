@@ -4,7 +4,7 @@
 import { query, withTransaction } from '../../db/index.js';
 import { assertRole } from '../context.js';
 import { httpError, logActivity, num, isoDate } from '../helpers.js';
-import { gstProvider, gstProviderName } from '../../services/gst/index.js';
+import { gstProvider, getGstProviderName } from '../../services/gst/index.js';
 
 export const gstTypeDefs = /* GraphQL */ `
   type EInvoice {
@@ -115,7 +115,7 @@ async function loadInvoiceContext(invoiceId) {
 export function gstResolvers() {
   return {
     Query: {
-      gstProvider: () => gstProviderName,
+      gstProvider: () => getGstProviderName(),
     },
 
     Mutation: {

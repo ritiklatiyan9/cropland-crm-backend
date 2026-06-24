@@ -24,6 +24,10 @@ export const distributorTypeDefs = /* GraphQL */ `
     creditAvailable: Float!
     gpsLat: Float
     gpsLng: Float
+    udyamNo: String
+    msmeType: String
+    msmeRegistered: Boolean!
+    msmeRegDate: String
     isActive: Boolean!
     createdAt: DateTime!
   }
@@ -48,6 +52,10 @@ export const distributorTypeDefs = /* GraphQL */ `
     creditLimit: Float = 0
     gpsLat: Float
     gpsLng: Float
+    udyamNo: String
+    msmeType: String
+    msmeRegistered: Boolean
+    msmeRegDate: String
   }
 
   extend type Query {
@@ -82,6 +90,10 @@ export const mapDistributor = (r) =>
     creditAvailable: (num(r.credit_limit) ?? 0) - (num(r.outstanding) ?? 0),
     gpsLat: num(r.gps_lat),
     gpsLng: num(r.gps_lng),
+    udyamNo: r.udyam_no,
+    msmeType: r.msme_type,
+    msmeRegistered: r.msme_registered ?? false,
+    msmeRegDate: r.msme_reg_date ? String(r.msme_reg_date).slice(0, 10) : null,
     isActive: r.is_active,
     createdAt: r.created_at,
   };
@@ -100,6 +112,10 @@ const vals = (i) => [
   i.creditLimit ?? 0,
   i.gpsLat ?? null,
   i.gpsLng ?? null,
+  i.udyamNo ?? null,
+  i.msmeType ?? null,
+  i.msmeRegistered ?? false,
+  i.msmeRegDate ?? null,
 ];
 
 export function distributorResolvers() {
@@ -141,8 +157,8 @@ export function distributorResolvers() {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const { rows } = await query(
           `INSERT INTO distributors
-             (name, contact_person, phone, email, gstin, dealer_tier, state, district, address, branch_id, credit_limit, gps_lat, gps_lng)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+             (name, contact_person, phone, email, gstin, dealer_tier, state, district, address, branch_id, credit_limit, gps_lat, gps_lng, udyam_no, msme_type, msme_registered, msme_reg_date)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
           vals(input),
         );
         await logActivity(actor.sub, 'CREATE_DISTRIBUTOR', 'distributor', rows[0].id);
@@ -153,7 +169,8 @@ export function distributorResolvers() {
         const { rows } = await query(
           `UPDATE distributors SET
              name=$2, contact_person=$3, phone=$4, email=$5, gstin=$6, dealer_tier=$7,
-             state=$8, district=$9, address=$10, branch_id=$11, credit_limit=$12, gps_lat=$13, gps_lng=$14, updated_at=now()
+             state=$8, district=$9, address=$10, branch_id=$11, credit_limit=$12, gps_lat=$13, gps_lng=$14,
+             udyam_no=$15, msme_type=$16, msme_registered=$17, msme_reg_date=$18, updated_at=now()
            WHERE id=$1 RETURNING *`,
           [id, ...vals(input)],
         );

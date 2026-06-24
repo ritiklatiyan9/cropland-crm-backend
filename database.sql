@@ -1300,7 +1300,161 @@ CREATE TABLE IF NOT EXISTS financial_ledger_entries (
 CREATE INDEX IF NOT EXISTS idx_fle_date ON financial_ledger_entries(entry_date);
 CREATE INDEX IF NOT EXISTS idx_fle_section ON financial_ledger_entries(statement, section);
 
+-- ─────────────────────────────────────────────────────────────
+-- GST COMPLIANCE SUITE  — GSTR-1 / GSTR-3B return snapshots, reconciliation
+-- (GSTR-2A/2B/GSTR-1/Challan), Invoice Management System (IMS) actions, and
+-- GST challans (PMT-06). Counterparty data is ingested from portal JSON exports
+-- downloaded from gst.gov.in and matched against books (invoices/purchases).
+-- ─────────────────────────────────────────────────────────────
+
+-- Generated GSTR-1 / GSTR-3B snapshots (one per return type + tax period).
+-- `period` is the GST period key MMYYYY (e.g. '062026'). Payload holds the
+-- portal-ready JSON; summary holds the headline figures shown in the UI.
+CREATE TABLE IF NOT EXISTS gst_returns (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  return_type   TEXT NOT NULL,                       -- GSTR1 / GSTR3B
+  period        TEXT NOT NULL,                        -- MMYYYY
+  gstin         TEXT,
+  payload       JSONB NOT NULL DEFAULT '{}'::jsonb,   -- portal-compatible JSON
+  summary       JSONB NOT NULL DEFAULT '{}'::jsonb,   -- headline totals
+  status        TEXT NOT NULL DEFAULT 'GENERATED',    -- GENERATED / FILED
+  filed_ref     TEXT,                                 -- ARN once filed (optional)
+  generated_by  UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (return_type, period)
+);
+CREATE INDEX IF NOT EXISTS idx_gst_returns_period ON gst_returns(period);
+
+-- A single uploaded portal file (GSTR-2A / GSTR-2B / GSTR-1 / Challan ledger).
+CREATE TABLE IF NOT EXISTS gst_recon_imports (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  source        TEXT NOT NULL,                        -- GSTR2A / GSTR2B / GSTR1 / CHALLAN
+  period        TEXT NOT NULL,                        -- MMYYYY
+  gstin         TEXT,
+  file_name     TEXT,
+  raw           JSONB,                                -- original uploaded JSON (audit)
+  line_count    INT NOT NULL DEFAULT 0,
+  uploaded_by   UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_recon_imports_period ON gst_recon_imports(source, period);
+
+-- Parsed counterparty documents from an import — the unit of reconciliation + IMS.
+CREATE TABLE IF NOT EXISTS gst_recon_docs (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  import_id           UUID NOT NULL REFERENCES gst_recon_imports(id) ON DELETE CASCADE,
+  source              TEXT NOT NULL,                  -- GSTR2A / GSTR2B / GSTR1
+  period              TEXT NOT NULL,
+  ctin                TEXT,                           -- counterparty GSTIN
+  trade_name          TEXT,
+  doc_type            TEXT NOT NULL DEFAULT 'INV',    -- INV / CN / DN
+  doc_no              TEXT,
+  doc_date            DATE,
+  taxable             NUMERIC(14,2) NOT NULL DEFAULT 0,
+  igst                NUMERIC(14,2) NOT NULL DEFAULT 0,
+  cgst                NUMERIC(14,2) NOT NULL DEFAULT 0,
+  sgst                NUMERIC(14,2) NOT NULL DEFAULT 0,
+  cess                NUMERIC(14,2) NOT NULL DEFAULT 0,
+  total               NUMERIC(14,2) NOT NULL DEFAULT 0,
+  itc_eligible        BOOLEAN,                        -- 2B ITC availability flag
+  match_status        TEXT NOT NULL DEFAULT 'PORTAL_ONLY', -- MATCHED / MISMATCH / PORTAL_ONLY / BOOKS_ONLY
+  matched_purchase_id UUID REFERENCES purchase_invoices(id) ON DELETE SET NULL,
+  ims_action          TEXT,                           -- ACCEPTED / REJECTED / PENDING / NO_ACTION
+  ims_acted_by        UUID REFERENCES users(id) ON DELETE SET NULL,
+  ims_acted_at        TIMESTAMPTZ,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_recon_docs_import ON gst_recon_docs(import_id);
+CREATE INDEX IF NOT EXISTS idx_recon_docs_period ON gst_recon_docs(source, period);
+CREATE INDEX IF NOT EXISTS idx_recon_docs_ctin ON gst_recon_docs(ctin);
+
+-- GST challans (Form GST PMT-06) — for Challan / cash-ledger reconciliation.
+CREATE TABLE IF NOT EXISTS gst_challans (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  cpin          TEXT,                                 -- Common Portal Identification No.
+  challan_no    TEXT,
+  period        TEXT,                                 -- MMYYYY the payment relates to
+  paid_date     DATE,
+  igst          NUMERIC(14,2) NOT NULL DEFAULT 0,
+  cgst          NUMERIC(14,2) NOT NULL DEFAULT 0,
+  sgst          NUMERIC(14,2) NOT NULL DEFAULT 0,
+  cess          NUMERIC(14,2) NOT NULL DEFAULT 0,
+  fees          NUMERIC(14,2) NOT NULL DEFAULT 0,
+  interest      NUMERIC(14,2) NOT NULL DEFAULT 0,
+  amount        NUMERIC(14,2) NOT NULL DEFAULT 0,     -- total challan value
+  mode          TEXT,                                 -- NEFT/RTGS/OTC/E-PAYMENT
+  status        TEXT NOT NULL DEFAULT 'PAID',         -- PAID / GENERATED / FAILED
+  import_id     UUID REFERENCES gst_recon_imports(id) ON DELETE SET NULL,
+  created_by    UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_gst_challans_period ON gst_challans(period);
+
+-- ─────────────────────────────────────────────────────────────
+-- MSME / UDYAM CLASSIFICATION  — for MSME Form-1 (MCA half-yearly return of
+-- dues outstanding > 45 days to Micro/Small enterprise suppliers) and to flag
+-- registered suppliers across the app. Captured on vendors (suppliers) and
+-- distributors (who may also supply).
+-- ─────────────────────────────────────────────────────────────
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS udyam_no          TEXT;
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS msme_type         TEXT;            -- MICRO / SMALL / MEDIUM / NA
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS msme_registered   BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS msme_reg_date     DATE;
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS payment_terms_days INT NOT NULL DEFAULT 45;  -- agreed credit period (MSMED cap 45)
+
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS udyam_no          TEXT;
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS msme_type         TEXT;
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS msme_registered   BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS msme_reg_date     DATE;
+
+-- ─────────────────────────────────────────────────────────────
+-- GST PARITY UPGRADE — exact tax capture + smart reconciliation (roadmap P0.2/P0.3/P2.1).
+-- ─────────────────────────────────────────────────────────────
+-- Credit/Debit notes: capture rate-wise tax so GSTR-1 CDNR is exact, not derived.
+ALTER TABLE credit_debit_notes ADD COLUMN IF NOT EXISTS taxable_value  NUMERIC(14,2);
+ALTER TABLE credit_debit_notes ADD COLUMN IF NOT EXISTS gst_rate       NUMERIC(5,2);
+ALTER TABLE credit_debit_notes ADD COLUMN IF NOT EXISTS cgst           NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE credit_debit_notes ADD COLUMN IF NOT EXISTS sgst           NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE credit_debit_notes ADD COLUMN IF NOT EXISTS igst           NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE credit_debit_notes ADD COLUMN IF NOT EXISTS is_interstate  BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE credit_debit_notes ADD COLUMN IF NOT EXISTS note_reason    TEXT; -- 01 Sales Return / 02 Post-sale discount / 03 Deficiency / 04 Correction / 05 Other
+
+-- Purchase invoices: tax head split + reverse-charge + ITC eligibility for books-based ITC (GSTR-3B Table 4) & 2A/2B recon.
+ALTER TABLE purchase_invoices ADD COLUMN IF NOT EXISTS igst            NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE purchase_invoices ADD COLUMN IF NOT EXISTS cgst            NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE purchase_invoices ADD COLUMN IF NOT EXISTS sgst            NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE purchase_invoices ADD COLUMN IF NOT EXISTS cess            NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE purchase_invoices ADD COLUMN IF NOT EXISTS is_interstate   BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE purchase_invoices ADD COLUMN IF NOT EXISTS is_rcm          BOOLEAN NOT NULL DEFAULT FALSE;  -- reverse charge
+ALTER TABLE purchase_invoices ADD COLUMN IF NOT EXISTS itc_eligibility TEXT NOT NULL DEFAULT 'ELIGIBLE'; -- ELIGIBLE / INELIGIBLE / PARTIAL
+
+-- Reconciliation: persist smart-match score/reason + manual decisions + ITC action.
+ALTER TABLE gst_recon_docs ADD COLUMN IF NOT EXISTS match_score      NUMERIC(5,2);
+ALTER TABLE gst_recon_docs ADD COLUMN IF NOT EXISTS match_reason     TEXT;
+ALTER TABLE gst_recon_docs ADD COLUMN IF NOT EXISTS note             TEXT;            -- analyst note / follow-up
+ALTER TABLE gst_recon_docs ADD COLUMN IF NOT EXISTS manual_match     BOOLEAN NOT NULL DEFAULT FALSE; -- user-confirmed link (survives re-import)
+ALTER TABLE gst_recon_docs ADD COLUMN IF NOT EXISTS itc_action       TEXT;            -- CLAIM / DEFER / INELIGIBLE / BLOCKED
+-- PROBABLE is now a valid match_status alongside MATCHED/MISMATCH/PORTAL_ONLY/BOOKS_ONLY.
+
+-- ─────────────────────────────────────────────────────────────
+-- GST API / GSP INTEGRATION — live e-invoice, e-way & return-filing credentials,
+-- configured from the Company Settings page. No mock: operations that need the
+-- portal throw until these are set + enabled.
+-- ─────────────────────────────────────────────────────────────
+ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS gst_api_provider  TEXT;          -- cleartax / masters-india / iris / custom
+ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS gst_api_base_url  TEXT;          -- GSP/IRP base URL
+ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS gst_api_client_id TEXT;
+ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS gst_api_username  TEXT;          -- GSTIN API username
+ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS gst_api_key       TEXT;          -- secret
+ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS gst_api_secret    TEXT;          -- secret
+ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS gst_api_password  TEXT;          -- secret
+ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS gst_api_enabled   BOOLEAN NOT NULL DEFAULT FALSE;
+
 -- ============================================================================
 -- End of schema (… + geo/enquiries + loyalty redemption + distributor app
---                + financial statements adjustments ledger)
+--                + financial statements adjustments ledger
+--                + GST compliance suite + MSME/Udyam classification
+--                + GST parity upgrade: exact tax capture + smart reconciliation
+--                + GST API / GSP integration credentials)
 -- ============================================================================
