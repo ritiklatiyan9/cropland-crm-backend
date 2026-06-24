@@ -4,6 +4,8 @@
 import { query, withTransaction } from '../../db/index.js';
 import { assertAuth, assertRole } from '../context.js';
 import { httpError, logActivity, num, isoDate } from '../helpers.js';
+import { splitTax, roundGst } from '../../services/gst/calc.js';
+import { resolveStateCode } from '../../services/gst/stateCodes.js';
 
 export const procurementTypeDefs = /* GraphQL */ `
   type Vendor {
@@ -17,6 +19,11 @@ export const procurementTypeDefs = /* GraphQL */ `
     city: String
     state: String
     outstanding: Float!
+    udyamNo: String
+    msmeType: String
+    msmeRegistered: Boolean!
+    msmeRegDate: String
+    paymentTermsDays: Int!
     isActive: Boolean!
     createdAt: DateTime!
   }
@@ -75,6 +82,11 @@ export const procurementTypeDefs = /* GraphQL */ `
     address: String
     city: String
     state: String
+    udyamNo: String
+    msmeType: String
+    msmeRegistered: Boolean
+    msmeRegDate: String
+    paymentTermsDays: Int
   }
   input POLineInput { productId: ID!, quantity: Float!, unitCost: Float! }
   input CreatePOInput { vendorId: ID!, orderDate: String, expectedDate: String, notes: String, lines: [POLineInput!]! }
@@ -101,7 +113,7 @@ export const procurementTypeDefs = /* GraphQL */ `
     approvePurchaseOrder(id: ID!): PurchaseOrder!
     cancelPurchaseOrder(id: ID!): PurchaseOrder!
     receivePurchaseOrder(input: ReceivePOInput!): PurchaseOrder!
-    recordPurchaseBill(poId: ID!, billNo: String!, invoiceDate: String): PurchaseInvoice!
+    recordPurchaseBill(poId: ID!, billNo: String!, invoiceDate: String, isRcm: Boolean, itcEligibility: String): PurchaseInvoice!
     recordVendorPayment(input: VendorPaymentInput!): Boolean!
   }
 `;
@@ -117,7 +129,11 @@ const mapVendor = (r) =>
   r && {
     id: r.id, name: r.name, contactPerson: r.contact_person, phone: r.phone, email: r.email,
     gstin: r.gstin, address: r.address, city: r.city, state: r.state,
-    outstanding: num(r.outstanding) ?? 0, isActive: r.is_active, createdAt: r.created_at,
+    outstanding: num(r.outstanding) ?? 0,
+    udyamNo: r.udyam_no, msmeType: r.msme_type, msmeRegistered: r.msme_registered ?? false,
+    msmeRegDate: r.msme_reg_date ? String(r.msme_reg_date).slice(0, 10) : null,
+    paymentTermsDays: r.payment_terms_days ?? 45,
+    isActive: r.is_active, createdAt: r.created_at,
   };
 const mapPO = (r) =>
   r && {
@@ -132,7 +148,7 @@ const mapPInv = (r) =>
     invoiceDate: isoDate(r.invoice_date), totalAmount: num(r.total_amount),
     amountPaid: num(r.amount_paid), balanceDue: num(r.total_amount) - num(r.amount_paid), createdAt: r.created_at,
   };
-const vVals = (i) => [i.name, i.contactPerson ?? null, i.phone ?? null, i.email ?? null, i.gstin ?? null, i.address ?? null, i.city ?? null, i.state ?? null];
+const vVals = (i) => [i.name, i.contactPerson ?? null, i.phone ?? null, i.email ?? null, i.gstin ?? null, i.address ?? null, i.city ?? null, i.state ?? null, i.udyamNo ?? null, i.msmeType ?? null, i.msmeRegistered ?? false, i.msmeRegDate ?? null, i.paymentTermsDays ?? 45];
 
 export function procurementResolvers() {
   return {
@@ -192,15 +208,16 @@ export function procurementResolvers() {
       createVendor: async (_p, { input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
         const { rows } = await query(
-          `INSERT INTO vendors (name, contact_person, phone, email, gstin, address, city, state)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`, vVals(input));
+          `INSERT INTO vendors (name, contact_person, phone, email, gstin, address, city, state, udyam_no, msme_type, msme_registered, msme_reg_date, payment_terms_days)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`, vVals(input));
         await logActivity(a.sub, 'CREATE_VENDOR', 'vendor', rows[0].id);
         return mapVendor(rows[0]);
       },
       updateVendor: async (_p, { id, input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
         const { rows } = await query(
-          `UPDATE vendors SET name=$2, contact_person=$3, phone=$4, email=$5, gstin=$6, address=$7, city=$8, state=$9, updated_at=now() WHERE id=$1 RETURNING *`,
+          `UPDATE vendors SET name=$2, contact_person=$3, phone=$4, email=$5, gstin=$6, address=$7, city=$8, state=$9,
+             udyam_no=$10, msme_type=$11, msme_registered=$12, msme_reg_date=$13, payment_terms_days=$14, updated_at=now() WHERE id=$1 RETURNING *`,
           [id, ...vVals(input)]);
         if (!rows[0]) throw httpError('Vendor not found', 404);
         await logActivity(a.sub, 'UPDATE_VENDOR', 'vendor', id);
@@ -324,7 +341,7 @@ export function procurementResolvers() {
         });
       },
 
-      recordPurchaseBill: async (_p, { poId, billNo, invoiceDate }, ctx) => {
+      recordPurchaseBill: async (_p, { poId, billNo, invoiceDate, isRcm, itcEligibility }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
         return withTransaction(async (client) => {
           const po = (await client.query('SELECT * FROM purchase_orders WHERE id=$1', [poId])).rows[0];
@@ -332,10 +349,20 @@ export function procurementResolvers() {
           const exists = await client.query('SELECT id FROM purchase_invoices WHERE po_id=$1', [poId]);
           if (exists.rows[0]) throw httpError('A bill already exists for this PO', 409);
           const internalNo = `PINV-${fy(invoiceDate)}-${String((await client.query("SELECT nextval('pbill_seq') n")).rows[0].n).padStart(5, '0')}`;
+
+          // Derive inter/intra from company vs vendor state, then split the PO tax into heads (books-based ITC).
+          const company = (await client.query('SELECT gstin, state FROM company_settings WHERE id = 1')).rows[0] || {};
+          const vendor = (await client.query('SELECT gstin, state FROM vendors WHERE id = $1', [po.vendor_id])).rows[0] || {};
+          const coState = resolveStateCode({ gstin: company.gstin, stateName: company.state });
+          const vState = resolveStateCode({ gstin: vendor.gstin, stateName: vendor.state });
+          const interstate = !!coState && !!vState && coState !== vState;
+          const s = splitTax(num(po.sub_total) || 0, num(po.sub_total) > 0 ? roundGst((num(po.tax_total) / num(po.sub_total)) * 100) : 0, interstate);
+          const elig = ['ELIGIBLE', 'INELIGIBLE', 'PARTIAL'].includes(String(itcEligibility || '').toUpperCase()) ? itcEligibility.toUpperCase() : 'ELIGIBLE';
+
           const inv = await client.query(
-            `INSERT INTO purchase_invoices (bill_no, internal_no, po_id, vendor_id, invoice_date, taxable_value, tax_value, total_amount, created_by)
-             VALUES ($1,$2,$3,$4,COALESCE($5,CURRENT_DATE),$6,$7,$8,$9) RETURNING *`,
-            [billNo, internalNo, poId, po.vendor_id, invoiceDate ?? null, num(po.sub_total), num(po.tax_total), num(po.total_amount), a.sub]);
+            `INSERT INTO purchase_invoices (bill_no, internal_no, po_id, vendor_id, invoice_date, taxable_value, tax_value, igst, cgst, sgst, is_interstate, is_rcm, itc_eligibility, total_amount, created_by)
+             VALUES ($1,$2,$3,$4,COALESCE($5,CURRENT_DATE),$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+            [billNo, internalNo, poId, po.vendor_id, invoiceDate ?? null, num(po.sub_total), num(po.tax_total), s.igst, s.cgst, s.sgst, interstate, !!isRcm, elig, num(po.total_amount), a.sub]);
           await client.query('UPDATE vendors SET outstanding = outstanding + $2 WHERE id=$1', [po.vendor_id, num(po.total_amount)]);
           await logActivity(a.sub, 'RECORD_PURCHASE_BILL', 'purchase_invoice', inv.rows[0].id, { billNo });
           const full = await client.query('SELECT pi.*, v.name vendor_name FROM purchase_invoices pi JOIN vendors v ON v.id=pi.vendor_id WHERE pi.id=$1', [inv.rows[0].id]);

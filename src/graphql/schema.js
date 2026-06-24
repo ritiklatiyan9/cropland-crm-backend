@@ -34,6 +34,11 @@ import { enquiryTypeDefs } from './modules/enquiries.js';
 import { redemptionTypeDefs } from './modules/redemptions.js';
 import { translateTypeDefs } from './modules/translate.js';
 import { financialsTypeDefs } from './modules/financials.js';
+import { gstReturnsTypeDefs } from './modules/gstReturns.js';
+import { gstReconTypeDefs } from './modules/gstRecon.js';
+import { gstUtilsTypeDefs } from './modules/gstUtils.js';
+import { msmeTypeDefs } from './modules/msme.js';
+import { agingTypeDefs } from './modules/aging.js';
 
 const baseTypeDefs = /* GraphQL */ `
   scalar DateTime
@@ -80,4 +85,9 @@ export const schema = [
   redemptionTypeDefs,
   translateTypeDefs,
   financialsTypeDefs,
+  gstReturnsTypeDefs,
+  gstReconTypeDefs,
+  gstUtilsTypeDefs,
+  msmeTypeDefs,
+  agingTypeDefs,
 ].join('\n');

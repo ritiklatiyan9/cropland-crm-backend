@@ -4,6 +4,7 @@ import { query } from '../../db/index.js';
 import { assertRole } from '../context.js';
 import { httpError, logActivity, num, isoDate } from '../helpers.js';
 import { dispatch } from '../../services/notify/index.js';
+import { splitTax, roundGst } from '../../services/gst/calc.js';
 
 export const financeTypeDefs = /* GraphQL */ `
   type LedgerEntry {
@@ -31,7 +32,13 @@ export const financeTypeDefs = /* GraphQL */ `
     distributorName: String
     noteType: String!
     amount: Float!
+    taxableValue: Float
+    gstRate: Float
+    cgst: Float!
+    sgst: Float!
+    igst: Float!
     reason: String
+    noteReason: String
     refInvoiceNo: String
     createdAt: DateTime!
   }
@@ -51,6 +58,10 @@ export const financeTypeDefs = /* GraphQL */ `
     distributorId: ID!
     noteType: String!     # CREDIT / DEBIT
     amount: Float!
+    taxableValue: Float    # optional — when given, tax is split exactly (not derived)
+    gstRate: Float
+    isInterstate: Boolean
+    noteReason: String     # 01 Sales Return / 02 Post-sale discount / 03 Deficiency / 04 Correction / 05 Other
     reason: String
     refInvoiceId: ID
   }
@@ -82,7 +93,13 @@ const mapNote = (r) => ({
   distributorName: r.dname ?? null,
   noteType: r.note_type,
   amount: num(r.amount),
+  taxableValue: num(r.taxable_value),
+  gstRate: num(r.gst_rate),
+  cgst: num(r.cgst) ?? 0,
+  sgst: num(r.sgst) ?? 0,
+  igst: num(r.igst) ?? 0,
   reason: r.reason,
+  noteReason: r.note_reason ?? null,
   refInvoiceNo: r.ref_invoice_no ?? null,
   createdAt: r.created_at,
 });
@@ -210,10 +227,24 @@ export function financeResolvers() {
         if (input.amount <= 0) throw httpError('Amount must be positive', 400);
         const seq = (await query("SELECT nextval('note_seq') AS n")).rows[0].n;
         const noteNo = `${type === 'CREDIT' ? 'CN' : 'DN'}-${fy()}-${String(seq).padStart(5, '0')}`;
+
+        // Tax capture: if taxable + rate given, split exactly; else derive interstate from the linked invoice.
+        let interstate = input.isInterstate ?? false;
+        if (input.refInvoiceId) {
+          const ri = (await query('SELECT is_interstate FROM invoices WHERE id = $1', [input.refInvoiceId])).rows[0];
+          if (ri && input.isInterstate == null) interstate = !!ri.is_interstate;
+        }
+        let taxable = null, rate = null, cgst = 0, sgst = 0, igst = 0;
+        if (input.taxableValue != null && input.gstRate != null) {
+          taxable = roundGst(input.taxableValue);
+          rate = input.gstRate;
+          const s = splitTax(taxable, rate, interstate);
+          cgst = s.cgst; sgst = s.sgst; igst = s.igst;
+        }
         const { rows } = await query(
-          `INSERT INTO credit_debit_notes (note_no, distributor_id, note_type, amount, reason, ref_invoice_id, created_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-          [noteNo, input.distributorId, type, input.amount, input.reason ?? null, input.refInvoiceId ?? null, actor.sub],
+          `INSERT INTO credit_debit_notes (note_no, distributor_id, note_type, amount, taxable_value, gst_rate, cgst, sgst, igst, is_interstate, note_reason, reason, ref_invoice_id, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+          [noteNo, input.distributorId, type, input.amount, taxable, rate, cgst, sgst, igst, interstate, input.noteReason ?? null, input.reason ?? null, input.refInvoiceId ?? null, actor.sub],
         );
         // CREDIT note reduces outstanding; DEBIT note increases it.
         const delta = type === 'CREDIT' ? -input.amount : input.amount;

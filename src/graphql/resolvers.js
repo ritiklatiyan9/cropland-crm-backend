@@ -31,6 +31,11 @@ import { enquiryResolvers } from './modules/enquiries.js';
 import { redemptionResolvers } from './modules/redemptions.js';
 import { translateResolvers } from './modules/translate.js';
 import { financialsResolvers } from './modules/financials.js';
+import { gstReturnsResolvers } from './modules/gstReturns.js';
+import { gstReconResolvers } from './modules/gstRecon.js';
+import { gstUtilsResolvers } from './modules/gstUtils.js';
+import { msmeResolvers } from './modules/msme.js';
+import { agingResolvers } from './modules/aging.js';
 
 const DateTime = new GraphQLScalarType({
   name: 'DateTime',
@@ -106,5 +111,10 @@ export function buildResolvers(app) {
     redemptionResolvers(app),
     translateResolvers(app),
     financialsResolvers(app),
+    gstReturnsResolvers(app),
+    gstReconResolvers(app),
+    gstUtilsResolvers(app),
+    msmeResolvers(app),
+    agingResolvers(app),
   ]);
 }
