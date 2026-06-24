@@ -276,7 +276,7 @@ export const orderTypeDefs = /* GraphQL */ `
     createOrder(input: CreateOrderInput!): Order!
     updateOrderTransport(orderId: ID!, input: OrderTransportInput!): Order!
     approveOrder(id: ID!): Order!
-    generateInvoice(orderId: ID!): Invoice!
+    generateInvoice(orderId: ID!, invoiceDate: String): Invoice!
     recordPayment(input: PaymentInput!): Payment!
     updateOrderStatus(id: ID!, status: String!): Order!
     cancelOrder(id: ID!): Order!
@@ -807,7 +807,7 @@ export function orderResolvers() {
         return mapOrder(rows[0]);
       },
 
-      generateInvoice: async (_p, { orderId }, ctx) => {
+      generateInvoice: async (_p, { orderId, invoiceDate }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         return withTransaction(async (client) => {
           const ord = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
@@ -875,12 +875,14 @@ export function orderResolvers() {
           const prefix = type === 'NON_GST' ? 'BOS' : company?.invoice_prefix || 'INV';
           const invoiceNo = `${prefix}-${financialYear()}-${String(seq).padStart(5, '0')}`;
 
+          // Capture the invoice date: explicit override → the order's date → today.
+          const invDate = invoiceDate || isoDate(order.order_date) || null;
           const inv = await client.query(
             `INSERT INTO invoices
-               (invoice_no, order_id, distributor_id, farmer_id, customer_type, bill_type, place_of_supply, is_interstate,
+               (invoice_no, order_id, distributor_id, farmer_id, customer_type, bill_type, invoice_date, place_of_supply, is_interstate,
                 taxable_value, cgst, sgst, igst, total_amount)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-            [invoiceNo, orderId, order.distributor_id, order.farmer_id, order.customer_type, type, buyerState, interstate, taxable, cgst, sgst, igst, total],
+             VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7::date, CURRENT_DATE),$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+            [invoiceNo, orderId, order.distributor_id, order.farmer_id, order.customer_type, type, invDate, buyerState, interstate, taxable, cgst, sgst, igst, total],
           );
 
           await client.query("UPDATE orders SET status='INVOICED', updated_at=now() WHERE id=$1", [orderId]);

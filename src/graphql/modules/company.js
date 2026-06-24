@@ -5,6 +5,7 @@ import { assertAuth, assertRole } from '../context.js';
 import { httpError, logActivity } from '../helpers.js';
 import { isAwsConfigured, getDownloadUrl } from '../../utils/aws.js';
 import { env } from '../../config/env.js';
+import { testGstApiConnection } from '../../services/gst/index.js';
 
 export const companyTypeDefs = /* GraphQL */ `
   type CompanySettings {
@@ -32,7 +33,30 @@ export const companyTypeDefs = /* GraphQL */ `
     gpsLat: Float
     gpsLng: Float
     distributorSuggestion: Boolean!
+    # GST API / GSP integration (secrets are never returned — only "set" flags)
+    gstApiProvider: String
+    gstApiBaseUrl: String
+    gstApiClientId: String
+    gstApiUsername: String
+    gstApiEnabled: Boolean!
+    gstApiKeySet: Boolean!
+    gstApiSecretSet: Boolean!
+    gstApiPasswordSet: Boolean!
+    gstApiConfigured: Boolean!
   }
+
+  input GstApiSettingsInput {
+    provider: String
+    baseUrl: String
+    clientId: String
+    username: String
+    apiKey: String      # secrets only update when a non-empty value is sent
+    apiSecret: String
+    password: String
+    enabled: Boolean
+  }
+
+  type GstConnTest { ok: Boolean!, message: String! }
 
   input CompanySettingsInput {
     legalName: String!
@@ -67,6 +91,8 @@ export const companyTypeDefs = /* GraphQL */ `
   extend type Mutation {
     updateCompanySettings(input: CompanySettingsInput!): CompanySettings!
     setDistributorSuggestion(enabled: Boolean!): Boolean!
+    updateGstApiSettings(input: GstApiSettingsInput!): CompanySettings!
+    testGstApiConnection: GstConnTest!
   }
 `;
 
@@ -95,6 +121,15 @@ export const mapCompany = (r) =>
     gpsLat: r.gps_lat == null ? null : Number(r.gps_lat),
     gpsLng: r.gps_lng == null ? null : Number(r.gps_lng),
     distributorSuggestion: r.distributor_suggestion ?? true,
+    gstApiProvider: r.gst_api_provider ?? null,
+    gstApiBaseUrl: r.gst_api_base_url ?? null,
+    gstApiClientId: r.gst_api_client_id ?? null,
+    gstApiUsername: r.gst_api_username ?? null,
+    gstApiEnabled: r.gst_api_enabled ?? false,
+    gstApiKeySet: !!r.gst_api_key,
+    gstApiSecretSet: !!r.gst_api_secret,
+    gstApiPasswordSet: !!r.gst_api_password,
+    gstApiConfigured: !!(r.gst_api_enabled && r.gst_api_base_url && r.gst_api_key),
   };
 
 export async function getCompany() {
@@ -140,6 +175,30 @@ export function companyResolvers() {
         await query('UPDATE company_settings SET distributor_suggestion = $1, updated_at = now() WHERE id = 1', [enabled]);
         await logActivity(actor.sub, 'TOGGLE_DISTRIBUTOR_SUGGESTION', 'company_settings', null, { enabled });
         return true;
+      },
+
+      // Secrets (apiKey/apiSecret/password) only overwrite when a non-empty value is sent,
+      // so the UI can show "configured" without forcing a re-entry on every save.
+      updateGstApiSettings: async (_p, { input }, ctx) => {
+        const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        const { rows } = await query(
+          `UPDATE company_settings SET
+             gst_api_provider = $1, gst_api_base_url = $2, gst_api_client_id = $3, gst_api_username = $4,
+             gst_api_key      = COALESCE(NULLIF($5,''), gst_api_key),
+             gst_api_secret   = COALESCE(NULLIF($6,''), gst_api_secret),
+             gst_api_password = COALESCE(NULLIF($7,''), gst_api_password),
+             gst_api_enabled  = COALESCE($8, gst_api_enabled), updated_at = now()
+           WHERE id = 1 RETURNING *`,
+          [input.provider ?? null, input.baseUrl ?? null, input.clientId ?? null, input.username ?? null,
+            input.apiKey ?? null, input.apiSecret ?? null, input.password ?? null, input.enabled ?? null],
+        );
+        await logActivity(actor.sub, 'UPDATE_GST_API_SETTINGS', 'company_settings', null, { provider: input.provider, enabled: input.enabled });
+        return mapCompany(rows[0]);
+      },
+
+      testGstApiConnection: async (_p, _a, ctx) => {
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        return testGstApiConnection();
       },
     },
     CompanySettings: {
