@@ -9,11 +9,11 @@ import { buildProfitLoss, buildBalanceSheet } from '../../services/finance/finan
 
 export const financialsTypeDefs = /* GraphQL */ `
   type TLine { label: String!, amount: Float! }
-  type BsGroup { group: String!, amount: Float!, lines: [TLine!]! }
+  type BsGroup { group: String!, amount: Float!, lines: [TLine!]!, expand: Boolean }
   type NamedAmount { name: String!, amount: Float! }
   type FixedAssetRow { label: String!, opening: Float!, addition: Float!, depreciation: Float!, closing: Float! }
   type CapitalSchedule { lines: [TLine!]!, netProfit: Float!, closing: Float! }
-  type CompanyMeta { legalName: String, tradeName: String, address: String, gstin: String, pan: String }
+  type CompanyMeta { legalName: String, tradeName: String, address: String, phone: String, gstin: String, pan: String }
   type StatementMeta {
     company: CompanyMeta!
     reportType: String!
@@ -96,9 +96,9 @@ export const financialsTypeDefs = /* GraphQL */ `
 
 const VALID_STATEMENTS = new Set(['TRADING', 'PL', 'BS']);
 const VALID_SECTIONS = new Set([
-  'DIRECT_EXPENSE', 'INDIRECT_EXPENSE', 'OTHER_INCOME', 'CAPITAL', 'SECURED_LOAN', 'UNSECURED_LOAN',
-  'CURRENT_LIABILITY', 'PROVISION', 'FIXED_ASSET', 'BANK', 'CASH', 'LOAN_ADVANCE',
-  'OTHER_ASSET', 'OTHER_LIABILITY', 'OPENING_STOCK', 'NOTE',
+  'DIRECT_EXPENSE', 'INDIRECT_EXPENSE', 'OTHER_INCOME', 'CAPITAL', 'SECURED_LOAN', 'UNSECURED_LOAN', 'LOAN',
+  'CURRENT_LIABILITY', 'PROVISION', 'FIXED_ASSET', 'INVESTMENT', 'BANK', 'CASH', 'LOAN_ADVANCE',
+  'OTHER_ASSET', 'OTHER_LIABILITY', 'OPENING_STOCK', 'PL_OPENING', 'NOTE',
 ]);
 
 const mapEntry = (r) => ({
