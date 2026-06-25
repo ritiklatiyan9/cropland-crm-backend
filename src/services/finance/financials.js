@@ -174,50 +174,65 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
   const bsMan = bySection(ledgerRows.rows.filter((r) => r.statement === 'BS'));
   const noteEntry = ledgerRows.rows.find((r) => r.section === 'NOTE');
 
-  const directExp = toLines(plMan.DIRECT_EXPENSE);
-  const indirectExp = toLines(plMan.INDIRECT_EXPENSE);
-  const otherIncome = toLines(plMan.OTHER_INCOME);
   const directExpTotal = sumAmt(plMan.DIRECT_EXPENSE);
   const indirectExpTotal = sumAmt(plMan.INDIRECT_EXPENSE);
   const otherIncomeTotal = sumAmt(plMan.OTHER_INCOME);
 
-  // ── Trading account ─────────────────────────────────────────
+  // ── Trading account — Tally "Profit & Loss A/c" top half ────
+  // Group-level lines (Purchase/Sales Accounts, Direct Expenses) exactly as the
+  // Tally statement shows them; the per-ledger detail lives in the Adjustments
+  // ledger and the schedules. Zero lines (e.g. Opening Stock) are kept so the
+  // layout matches Tally, which prints the label with a blank amount.
   const creditBase = r2(salesNet + closingStock);
   const debitBase = r2(openingStock + purchasesNet + directExpTotal);
   const grossProfit = r2(creditBase - debitBase); // ≥0 profit, <0 loss
 
   const tradingDebit = [
-    { label: 'To Opening Stock', amount: openingStock },
-    { label: 'To Purchases', amount: purchasesNet },
-    ...directExp.map((l) => ({ label: `To ${l.label}`, amount: l.amount })),
+    { label: 'Opening Stock', amount: openingStock },
+    { label: 'Purchase Accounts', amount: purchasesNet },
   ];
+  if (directExpTotal) tradingDebit.push({ label: 'Direct Expenses', amount: directExpTotal });
   const tradingCredit = [
-    { label: 'By Sales', amount: salesNet },
-    { label: 'By Closing Stock', amount: closingStock },
+    { label: 'Sales Accounts', amount: salesNet },
+    { label: 'Closing Stock', amount: closingStock },
   ];
-  if (grossProfit >= 0) tradingDebit.push({ label: 'To Gross Profit c/d', amount: grossProfit });
-  else tradingCredit.push({ label: 'By Gross Loss c/d', amount: r2(-grossProfit) });
+  if (grossProfit >= 0) tradingDebit.push({ label: 'Gross Profit c/o', amount: grossProfit });
+  else tradingCredit.push({ label: 'Gross Loss c/o', amount: r2(-grossProfit) });
   const tradingTotal = grossProfit >= 0 ? creditBase : debitBase;
 
-  // ── Profit & Loss account ───────────────────────────────────
+  // ── Profit & Loss account — Tally bottom half ───────────────
   const plCredit = [];
   const plDebit = [];
-  if (grossProfit >= 0) plCredit.push({ label: 'By Gross Profit b/d', amount: grossProfit });
-  else plDebit.push({ label: 'To Gross Loss b/d', amount: r2(-grossProfit) });
-  for (const l of otherIncome) plCredit.push({ label: `By ${l.label}`, amount: l.amount });
-  for (const l of indirectExp) plDebit.push({ label: `To ${l.label}`, amount: l.amount });
+  if (grossProfit >= 0) plCredit.push({ label: 'Gross Profit b/f', amount: grossProfit });
+  else plDebit.push({ label: 'Gross Loss b/f', amount: r2(-grossProfit) });
+  if (indirectExpTotal) plDebit.push({ label: 'Indirect Expenses', amount: indirectExpTotal });
+  // Tally always lists "Indirect Incomes" on the credit side (blank when zero).
+  plCredit.push({ label: 'Indirect Incomes', amount: otherIncomeTotal });
 
   const plCreditBase = r2((grossProfit >= 0 ? grossProfit : 0) + otherIncomeTotal);
   const plDebitBase = r2((grossProfit < 0 ? -grossProfit : 0) + indirectExpTotal);
   const netProfit = r2(plCreditBase - plDebitBase); // ≥0 profit, <0 loss
-  if (netProfit >= 0) plDebit.push({ label: 'To Net Profit', amount: netProfit });
-  else plCredit.push({ label: 'By Net Loss', amount: r2(-netProfit) });
+  if (netProfit >= 0) plDebit.push({ label: 'Nett Profit', amount: netProfit });
+  else plCredit.push({ label: 'Nett Loss', amount: r2(-netProfit) });
   const plTotal = netProfit >= 0 ? plCreditBase : plDebitBase;
 
-  // ── Balance Sheet — capital absorbs the net profit/loss ─────
+  // ── Balance Sheet (Tally layout) ────────────────────────────
+  // Tally shows top-level groups collapsed (one line each); only the Profit &
+  // Loss A/c expands to "Opening Balance" + "Current Period". So each group keeps
+  // its detail in `lines` but carries `expand` to say whether the main statement
+  // prints those sub-lines (the schedules below always show the full breakdown).
   const capitalComponents = toLines(bsMan.CAPITAL);
   const capitalBase = sumAmt(bsMan.CAPITAL);
-  const closingCapital = r2(capitalBase + netProfit);
+  const closingCapital = r2(capitalBase + netProfit); // used by the Capital schedule
+
+  // Profit & Loss A/c carried into the Balance Sheet: opening (accumulated, from a
+  // manual PL_OPENING entry if any) + current-period net profit/loss.
+  const plOpening = sumAmt(bsMan.PL_OPENING);
+  const plBalance = r2(plOpening + netProfit); // ≥0 ⇒ on Liabilities, <0 ⇒ on Assets
+  const plAccountLines = [
+    { label: 'Opening Balance', amount: plOpening },
+    { label: 'Current Period', amount: netProfit },
+  ];
 
   const fixedAssets = (bsMan.FIXED_ASSET ?? []).map((r) => {
     const meta = r.meta || {};
@@ -230,11 +245,14 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
   });
   const fixedAssetsTotal = r2(fixedAssets.reduce((s, a) => s + a.closing, 0));
 
-  // Build grouped liability + asset sections (each: {group, amount, lines[]}).
+  const grp = (group, amount, lines = [], expand = false) => ({ group, amount: r2(amount), lines, expand });
+
+  // ── Liabilities ──
   const liabilities = [];
-  liabilities.push({ group: 'Capital Account', amount: closingCapital, lines: [...capitalComponents, { label: 'Add: Net Profit / (Loss)', amount: netProfit }] });
-  if ((bsMan.SECURED_LOAN ?? []).length) liabilities.push({ group: 'Secured Loans', amount: sumAmt(bsMan.SECURED_LOAN), lines: toLines(bsMan.SECURED_LOAN) });
-  if ((bsMan.UNSECURED_LOAN ?? []).length) liabilities.push({ group: 'Unsecured Loans', amount: sumAmt(bsMan.UNSECURED_LOAN), lines: toLines(bsMan.UNSECURED_LOAN) });
+  if (capitalBase || capitalComponents.length) liabilities.push(grp('Capital Account', capitalBase, capitalComponents));
+
+  const loanLines = [...toLines(bsMan.SECURED_LOAN), ...toLines(bsMan.UNSECURED_LOAN), ...toLines(bsMan.LOAN)];
+  if (loanLines.length) liabilities.push(grp('Loans (Liability)', loanLines.reduce((s, l) => s + l.amount, 0), loanLines));
 
   const currentLiab = [];
   if (creditorsTotal) currentLiab.push({ label: 'Sundry Creditors', amount: creditorsTotal });
@@ -242,11 +260,17 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
   if (netGst > 0) currentLiab.push({ label: 'GST Payable', amount: netGst });
   for (const l of toLines(bsMan.CURRENT_LIABILITY)) currentLiab.push(l);
   for (const l of toLines(bsMan.PROVISION)) currentLiab.push(l);
-  if (currentLiab.length) liabilities.push({ group: 'Current Liabilities & Provisions', amount: r2(currentLiab.reduce((s, l) => s + l.amount, 0)), lines: currentLiab });
-  if ((bsMan.OTHER_LIABILITY ?? []).length) liabilities.push({ group: 'Other Liabilities', amount: sumAmt(bsMan.OTHER_LIABILITY), lines: toLines(bsMan.OTHER_LIABILITY) });
+  if (currentLiab.length) liabilities.push(grp('Current Liabilities', currentLiab.reduce((s, l) => s + l.amount, 0), currentLiab));
+  if ((bsMan.OTHER_LIABILITY ?? []).length) liabilities.push(grp('Other Liabilities', sumAmt(bsMan.OTHER_LIABILITY), toLines(bsMan.OTHER_LIABILITY)));
 
+  // Profit & Loss A/c on the Liabilities side when it is a credit (net profit).
+  if (plBalance > 0) liabilities.push(grp('Profit & Loss A/c', plBalance, plAccountLines, true));
+
+  // ── Assets ──
   const assets = [];
-  if (fixedAssetsTotal || fixedAssets.length) assets.push({ group: 'Fixed Assets', amount: fixedAssetsTotal, lines: fixedAssets.map((a) => ({ label: a.label, amount: a.closing })) });
+  if (fixedAssetsTotal || fixedAssets.length) assets.push(grp('Fixed Assets', fixedAssetsTotal, fixedAssets.map((a) => ({ label: a.label, amount: a.closing }))));
+
+  if ((bsMan.INVESTMENT ?? []).length) assets.push(grp('Investments', sumAmt(bsMan.INVESTMENT), toLines(bsMan.INVESTMENT)));
 
   const currentAssets = [];
   if (closingStock) currentAssets.push({ label: 'Closing Stock', amount: closingStock });
@@ -256,7 +280,10 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
   for (const l of toLines(bsMan.LOAN_ADVANCE)) currentAssets.push(l);
   if (netGst < 0) currentAssets.push({ label: 'GST Receivable', amount: r2(-netGst) });
   for (const l of toLines(bsMan.OTHER_ASSET)) currentAssets.push(l);
-  if (currentAssets.length) assets.push({ group: 'Current Assets, Loans & Advances', amount: r2(currentAssets.reduce((s, l) => s + l.amount, 0)), lines: currentAssets });
+  if (currentAssets.length) assets.push(grp('Current Assets', currentAssets.reduce((s, l) => s + l.amount, 0), currentAssets));
+
+  // Profit & Loss A/c on the Assets side when it is a debit (accumulated loss).
+  if (plBalance < 0) assets.push(grp('Profit & Loss A/c', -plBalance, plAccountLines, true));
 
   const liabilitiesTotal = r2(liabilities.reduce((s, x) => s + x.amount, 0));
   const assetsTotal = r2(assets.reduce((s, x) => s + x.amount, 0));
@@ -268,6 +295,7 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
       legalName: c.legal_name ?? null,
       tradeName: c.trade_name ?? null,
       address: [c.address_line1, c.address_line2, c.city, c.state, c.pincode].filter(Boolean).join(', ') || null,
+      phone: c.phone ?? null,
       gstin: c.gstin ?? null,
       pan: c.pan ?? null,
     },
