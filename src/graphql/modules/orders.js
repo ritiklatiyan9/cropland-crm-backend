@@ -700,8 +700,8 @@ export function orderResolvers() {
             (await client.query("SELECT nextval('order_seq') AS n")).rows[0].n,
           ).padStart(5, '0')}`;
 
-          // Transport & logistics (optional) — delivery address falls back to the legacy top-level field.
-          const t = input.transport ?? {};
+          // Transport & logistics (GST only) — non-GST bills skip transport entirely.
+          const t = billType === 'NON_GST' ? {} : (input.transport ?? {});
           const deliveryAddress = t.deliveryAddress ?? input.deliveryAddress ?? null;
           const ord = await client.query(
             `INSERT INTO orders (
