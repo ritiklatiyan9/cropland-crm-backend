@@ -172,10 +172,12 @@ SELECT
 FROM (VALUES
   ('SUPER_ADMIN'::user_role), ('ADMIN'), ('SUB_ADMIN'), ('SALES'), ('DISTRIBUTOR'), ('FARMER')
 ) AS r(role)
+-- Canonical module list — mirrors the admin sidebar (crm-cropland-admin nav.ts navModules).
 CROSS JOIN (VALUES
-  ('Dashboard'), ('User Management'), ('Roles & Permissions'), ('Product Master'),
-  ('Pricing'), ('Manufacturing'), ('Inventory'), ('Orders & Billing'),
-  ('Farmers / CRM'), ('Loyalty'), ('AI Advisory'), ('Complaints'), ('Analytics')
+  ('Dashboard'), ('Product Master'), ('Pricing'), ('Orders & Billing'),
+  ('Distributors'), ('Inventory'), ('Returns'), ('Loyalty'), ('Procurement'),
+  ('GST'), ('MSME'), ('Manufacturing'), ('AI'), ('Analytics'),
+  ('CRM'), ('Notifications'), ('UserManagement')
 ) AS m(module)
 ON CONFLICT (role, module) DO NOTHING;
 

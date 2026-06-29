@@ -250,6 +250,14 @@ export const orderTypeDefs = /* GraphQL */ `
     lines: [OrderLineInput!]!
   }
 
+  "Edit an existing (pre-invoice) order. Totals are recomputed from the supplied lines + discount."
+  input UpdateOrderInput {
+    orderDate: String
+    notes: String
+    discountAmount: Float
+    lines: [OrderLineInput!]!
+  }
+
   input PaymentInput {
     invoiceId: ID!
     amount: Float!
@@ -280,6 +288,10 @@ export const orderTypeDefs = /* GraphQL */ `
     recordPayment(input: PaymentInput!): Payment!
     updateOrderStatus(id: ID!, status: String!): Order!
     cancelOrder(id: ID!): Order!
+    "Edit a pre-invoice order's lines, discount, date & notes. Blocked once invoiced."
+    updateOrder(id: ID!, input: UpdateOrderInput!): Order!
+    "Permanently delete an order/bill and unwind its side effects (invoice, GST docs, payments, stock, outstanding). Admins only."
+    deleteOrder(id: ID!): Boolean!
   }
 `;
 
@@ -934,6 +946,117 @@ export function orderResolvers() {
         const { rows } = await query("UPDATE orders SET status='CANCELLED', updated_at=now() WHERE id=$1 RETURNING *", [id]);
         await logActivity(actor.sub, 'CANCEL_ORDER', 'order', id);
         return mapOrder(rows[0]);
+      },
+
+      // Edit a pre-invoice order. Recomputes all totals from the supplied lines and
+      // bill discount, then replaces the order_lines. Blocked once the order has been
+      // invoiced/dispatched/delivered (those derive stock, GST docs & balances).
+      updateOrder: async (_p, { id, input }, ctx) => {
+        const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        if (!input.lines?.length) throw httpError('Order must have at least one line', 400);
+        return withTransaction(async (client) => {
+          const order = (await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [id])).rows[0];
+          if (!order) throw httpError('Order not found', 404);
+          if (order.status === 'CANCELLED') throw httpError('Cannot edit a cancelled order', 400);
+          if (['INVOICED', 'DISPATCHED', 'DELIVERED'].includes(order.status))
+            throw httpError('Cannot edit an invoiced order — cancel or delete it instead', 400);
+
+          const billType = order.bill_type === 'NON_GST' ? 'NON_GST' : 'GST';
+          const customerType = order.customer_type === 'FARMER' ? 'FARMER' : 'DISTRIBUTOR';
+
+          // Re-snapshot product data + recompute line totals (same rules as createOrder).
+          let subTotal = 0;
+          const lines = [];
+          for (const l of input.lines) {
+            const p = (await client.query('SELECT * FROM products WHERE id = $1', [l.productId])).rows[0];
+            if (!p) throw httpError('Product not found', 404);
+            const defaultPrice = customerType === 'FARMER'
+              ? num(p.mrp ?? p.dealer_price ?? p.distributor_price ?? 0)
+              : num(p.distributor_price ?? p.dealer_price ?? p.mrp ?? 0);
+            const unitPrice = l.unitPrice ?? defaultPrice;
+            const disc = l.discountPct ?? 0;
+            const lineTotal = round2(l.quantity * unitPrice * (1 - disc / 100));
+            const gst = billType === 'GST' ? num(p.gst_percent ?? 0) : 0;
+            subTotal += lineTotal;
+            lines.push({ p, l, unitPrice, disc, lineTotal, gst });
+          }
+          subTotal = round2(subTotal);
+          const discountTotal = round2(Math.min(Math.max(input.discountAmount != null ? num(input.discountAmount) : num(order.discount_total), 0), subTotal));
+          const factor = subTotal > 0 ? (subTotal - discountTotal) / subTotal : 1;
+          let taxTotal = 0;
+          for (const ln of lines) taxTotal += round2((ln.lineTotal * factor * ln.gst) / 100);
+          taxTotal = round2(taxTotal);
+          const total = round2(subTotal - discountTotal + taxTotal);
+
+          await client.query(
+            `UPDATE orders SET order_date = COALESCE($2::date, order_date), notes = $3,
+               sub_total = $4, discount_total = $5, tax_total = $6, total_amount = $7, updated_at = now()
+             WHERE id = $1`,
+            [id, input.orderDate ?? null, input.notes ?? null, subTotal, discountTotal, taxTotal, total],
+          );
+          // Replace the line items wholesale (order_lines cascade-delete with the order).
+          await client.query('DELETE FROM order_lines WHERE order_id = $1', [id]);
+          for (const { p, l, unitPrice, disc, lineTotal, gst } of lines) {
+            await client.query(
+              `INSERT INTO order_lines (order_id, product_id, product_name, hsn_code, uom, quantity, unit_price, discount_pct, gst_percent, line_total)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+              [id, p.id, p.name, p.hsn_code, p.uom, l.quantity, unitPrice, disc, gst, lineTotal],
+            );
+          }
+          await logActivity(actor.sub, 'UPDATE_ORDER', 'order', id, { orderNo: order.order_no });
+          const updated = (await client.query('SELECT * FROM orders WHERE id = $1', [id])).rows[0];
+          return mapOrder(updated);
+        });
+      },
+
+      // Hard-delete an order/bill and fully unwind everything it touched. Restricted
+      // to admins. Unlike cancelOrder (which only marks PLACED/APPROVED orders), this
+      // removes invoiced bills too — reversing stock, distributor outstanding, payments
+      // and GST e-documents so no orphaned/derived data is left behind.
+      deleteOrder: async (_p, { id }, ctx) => {
+        const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        return withTransaction(async (client) => {
+          const ord = (await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [id])).rows[0];
+          if (!ord) throw httpError('Order not found', 404);
+          const isFarmer = ord.customer_type === 'FARMER';
+
+          // If the order was invoiced, the invoice FK is RESTRICT — unwind it first.
+          const inv = (await client.query('SELECT * FROM invoices WHERE order_id = $1 FOR UPDATE', [id])).rows[0];
+          if (inv) {
+            // 1) Put dispatched stock back: reverse the FIFO OUT movements booked at
+            //    invoicing (quantity is stored negative, so subtract to add back).
+            const moves = (await client.query(
+              "SELECT * FROM stock_movements WHERE ref_type='invoice' AND ref_id=$1 AND movement_type='OUT'",
+              [id],
+            )).rows;
+            for (const m of moves) {
+              if (!m.batch_id) continue;
+              await client.query(
+                `UPDATE stock_levels SET quantity = quantity - $1, updated_at = now()
+                 WHERE warehouse_id = $2 AND product_id = $3 AND batch_id = $4`,
+                [m.quantity, m.warehouse_id, m.product_id, m.batch_id],
+              );
+            }
+            await client.query("DELETE FROM stock_movements WHERE ref_type='invoice' AND ref_id=$1", [id]);
+
+            // 2) Reverse the distributor's outstanding by the still-unpaid balance.
+            //    (Payments already reduced it; removing those payments below nets out.)
+            const balanceDue = round2(num(inv.total_amount) - num(inv.amount_paid));
+            if (!isFarmer && ord.distributor_id && balanceDue > 0) {
+              await client.query('UPDATE distributors SET outstanding = GREATEST(outstanding - $2, 0) WHERE id = $1', [ord.distributor_id, balanceDue]);
+            }
+
+            // 3) Drop payments recorded against this bill, then the invoice itself
+            //    (cascades e_invoices & eway_bills; credit/debit notes are unlinked).
+            await client.query('DELETE FROM payments WHERE invoice_id = $1', [inv.id]);
+            await client.query('DELETE FROM invoices WHERE id = $1', [inv.id]);
+          }
+
+          // 4) Delete the order — order_lines cascade; loyalty txns & sales returns unlink.
+          await client.query('DELETE FROM orders WHERE id = $1', [id]);
+          await logActivity(actor.sub, 'DELETE_ORDER', 'order', id, { orderNo: ord.order_no, hadInvoice: !!inv });
+          return true;
+        });
       },
     },
 
