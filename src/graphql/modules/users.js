@@ -144,6 +144,8 @@ export const userTypeDefs = /* GraphQL */ `
     updateUser(id: ID!, input: UpdateUserInput!): User!
     setUserActive(id: ID!, isActive: Boolean!): User!
     resetUserPassword(id: ID!, newPassword: String!): Boolean!
+    "Self-service: the signed-in user changes their own password (verifies the current one)."
+    updateMyPassword(currentPassword: String!, newPassword: String!): Boolean!
     deleteUser(id: ID!): Boolean!
     createBranch(input: BranchInput!): Branch!
     setRolePermission(
@@ -406,6 +408,19 @@ export function userResolvers(app) {
         );
         if (!rowCount) throw httpError('User not found', 404);
         await logActivity(actor.sub, 'RESET_PASSWORD', 'user', id);
+        return true;
+      },
+      // Self-service password change for the signed-in user. Verifies the current
+      // password before updating — no admin role required (any authenticated user).
+      updateMyPassword: async (_p, { currentPassword, newPassword }, ctx) => {
+        const actor = assertAuth(ctx);
+        if (newPassword.length < 8) throw httpError('New password must be at least 8 characters', 400);
+        if (currentPassword === newPassword) throw httpError('New password must be different from the current one', 400);
+        const user = (await query('SELECT password_hash FROM users WHERE id = $1', [actor.sub])).rows[0];
+        if (!user) throw httpError('User not found', 404);
+        if (!(await bcrypt.compare(currentPassword, user.password_hash))) throw httpError('Current password is incorrect', 400);
+        await query('UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1', [actor.sub, await bcrypt.hash(newPassword, 10)]);
+        await logActivity(actor.sub, 'CHANGE_PASSWORD', 'user', actor.sub);
         return true;
       },
       deleteUser: async (_p, { id }, ctx) => {
