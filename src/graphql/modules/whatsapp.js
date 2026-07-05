@@ -75,10 +75,10 @@ async function recipientsFor(audience) {
 export function whatsappResolvers() {
   return {
     Query: {
-      waCampaigns: async (_p, { limit }, ctx) => { assertAuth(ctx); const { rows } = await query(`${SELECT} ORDER BY c.created_at DESC LIMIT $1`, [limit]); return rows.map(mapCampaign); },
-      waCampaign: async (_p, { id }, ctx) => { assertAuth(ctx); const { rows } = await query(`${SELECT} WHERE c.id=$1`, [id]); return mapCampaign(rows[0]); },
+      waCampaigns: async (_p, { limit }, ctx) => { assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES'); const { rows } = await query(`${SELECT} ORDER BY c.created_at DESC LIMIT $1`, [limit]); return rows.map(mapCampaign); },
+      waCampaign: async (_p, { id }, ctx) => { assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES'); const { rows } = await query(`${SELECT} WHERE c.id=$1`, [id]); return mapCampaign(rows[0]); },
       waMessages: async (_p, { campaignId }, ctx) => {
-        assertAuth(ctx);
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const { rows } = await query('SELECT * FROM whatsapp_messages WHERE campaign_id=$1 ORDER BY sent_at DESC LIMIT 1000', [campaignId]);
         return rows.map((r) => ({ id: r.id, name: r.name, phone: r.phone, status: r.status, error: r.error, sentAt: r.sent_at }));
       },

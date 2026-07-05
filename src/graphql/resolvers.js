@@ -36,6 +36,7 @@ import { gstReconResolvers } from './modules/gstRecon.js';
 import { gstUtilsResolvers } from './modules/gstUtils.js';
 import { msmeResolvers } from './modules/msme.js';
 import { agingResolvers } from './modules/aging.js';
+import { adminDataResolvers } from './modules/adminData.js';
 
 const DateTime = new GraphQLScalarType({
   name: 'DateTime',
@@ -116,5 +117,6 @@ export function buildResolvers(app) {
     gstUtilsResolvers(app),
     msmeResolvers(app),
     agingResolvers(app),
+    adminDataResolvers(app),
   ]);
 }

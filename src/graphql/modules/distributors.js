@@ -4,6 +4,15 @@
 import { query } from '../../db/index.js';
 import { assertAuth, assertRole } from '../context.js';
 import { httpError, logActivity, num } from '../helpers.js';
+import { validateGstin } from '../../services/gst/stateCodes.js';
+
+/** Reject a malformed GSTIN before it corrupts downstream GST/e-invoice/EWB docs. */
+function assertGstinIfPresent(gstin) {
+  const g = (gstin ?? '').trim();
+  if (!g) return;
+  const v = validateGstin(g);
+  if (!v.valid) throw httpError(`Invalid GSTIN: ${v.reason}`, 400);
+}
 
 export const distributorTypeDefs = /* GraphQL */ `
   type Distributor {
@@ -155,6 +164,7 @@ export function distributorResolvers() {
     Mutation: {
       createDistributor: async (_p, { input }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        assertGstinIfPresent(input.gstin);
         const { rows } = await query(
           `INSERT INTO distributors
              (name, contact_person, phone, email, gstin, dealer_tier, state, district, address, branch_id, credit_limit, gps_lat, gps_lng, udyam_no, msme_type, msme_registered, msme_reg_date)
@@ -166,6 +176,7 @@ export function distributorResolvers() {
       },
       updateDistributor: async (_p, { id, input }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        assertGstinIfPresent(input.gstin);
         const { rows } = await query(
           `UPDATE distributors SET
              name=$2, contact_person=$3, phone=$4, email=$5, gstin=$6, dealer_tier=$7,
@@ -190,7 +201,14 @@ export function distributorResolvers() {
       },
       deleteDistributor: async (_p, { id }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
-        const { rowCount } = await query('DELETE FROM distributors WHERE id = $1', [id]);
+        let rowCount;
+        try {
+          ({ rowCount } = await query('DELETE FROM distributors WHERE id = $1', [id]));
+        } catch (err) {
+          // Referenced by invoices/orders (ON DELETE RESTRICT) — clean guard, not a 500.
+          if (err.code === '23503') throw httpError('This distributor has invoices or orders and cannot be deleted. Deactivate it instead.', 409);
+          throw err;
+        }
         if (!rowCount) throw httpError('Distributor not found', 404);
         await logActivity(actor.sub, 'DELETE_DISTRIBUTOR', 'distributor', id);
         return true;

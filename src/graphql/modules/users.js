@@ -347,6 +347,9 @@ export function userResolvers(app) {
       },
       createUser: async (_p, { input }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        // Only a SUPER_ADMIN may mint another SUPER_ADMIN — otherwise an ADMIN could
+        // self-escalate by creating a super account and logging into it.
+        if (input.role === 'SUPER_ADMIN' && actor.role !== 'SUPER_ADMIN') throw httpError('Only a Super Admin can create a Super Admin', 403);
         if (input.password.length < 8) throw httpError('Password must be at least 8 characters', 400);
         const passwordHash = await bcrypt.hash(input.password, 10);
         let rows;
@@ -375,6 +378,13 @@ export function userResolvers(app) {
       },
       updateUser: async (_p, { id, input }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        // Guard the SUPER_ADMIN tier from ADMINs: they can neither target an existing
+        // super account nor promote anyone (incl. themselves) into it.
+        if (actor.role !== 'SUPER_ADMIN') {
+          if (input.role === 'SUPER_ADMIN') throw httpError('Only a Super Admin can grant the Super Admin role', 403);
+          const target = (await query('SELECT role FROM users WHERE id = $1', [id])).rows[0];
+          if (target?.role === 'SUPER_ADMIN') throw httpError('Only a Super Admin can modify a Super Admin account', 403);
+        }
         const { rows } = await query(
           `UPDATE users SET
              name=$2, phone=$3, role=$4, branch_id=$5,
@@ -390,6 +400,10 @@ export function userResolvers(app) {
       setUserActive: async (_p, { id, isActive }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
         if (id === actor.sub && !isActive) throw httpError('You cannot deactivate your own account', 400);
+        if (actor.role !== 'SUPER_ADMIN') {
+          const target = (await query('SELECT role FROM users WHERE id = $1', [id])).rows[0];
+          if (target?.role === 'SUPER_ADMIN') throw httpError('Only a Super Admin can (de)activate a Super Admin account', 403);
+        }
         const { rows } = await query(
           'UPDATE users SET is_active = $2, updated_at = now() WHERE id = $1 RETURNING *',
           [id, isActive],
@@ -400,6 +414,11 @@ export function userResolvers(app) {
       },
       resetUserPassword: async (_p, { id, newPassword }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        // An ADMIN resetting a SUPER_ADMIN's password would be account takeover.
+        if (actor.role !== 'SUPER_ADMIN') {
+          const target = (await query('SELECT role FROM users WHERE id = $1', [id])).rows[0];
+          if (target?.role === 'SUPER_ADMIN') throw httpError('Only a Super Admin can reset a Super Admin password', 403);
+        }
         if (newPassword.length < 8) throw httpError('Password must be at least 8 characters', 400);
         const passwordHash = await bcrypt.hash(newPassword, 10);
         const { rowCount } = await query(

@@ -296,6 +296,10 @@ export function loyaltyResolvers() {
       creditLoyaltyPoints: async (_p, { farmerCode, points, note }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES', 'DISTRIBUTOR');
         if (points <= 0) throw httpError('Points must be positive', 400);
+        // Distributors self-serve this from the app; cap a single manual credit so a
+        // compromised/colluding dealer token can't mint points out of thin air.
+        // (₹100 spend = 1 coin, so 5,000 coins ≈ ₹5,00,000 of purchases — generous.)
+        if (actor.role === 'DISTRIBUTOR' && points > 5000) throw httpError('A single manual credit is capped at 5,000 points', 400);
         return withTransaction(async (client) => {
           const f = await client.query('SELECT * FROM farmers WHERE farmer_code = $1 FOR UPDATE', [farmerCode]);
           if (!f.rows[0]) throw httpError('Farmer not found', 404);

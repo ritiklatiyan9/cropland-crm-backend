@@ -38,6 +38,16 @@ export default async function uploadRoutes(fastify) {
     return handleImageUpload(req, reply);
   });
 
+  // Documents (non-image) clients may presign, and the content-types permitted.
+  // An open prefix/content-type let a client upload web-served HTML (stored XSS).
+  const ALLOWED_DOC_FOLDERS = new Set([...ALLOWED_FOLDERS, 'documents', 'coa', 'msds', 'invoices', 'complaints']);
+  const ALLOWED_CONTENT_TYPES = new Set([
+    'image/jpeg', 'image/png', 'image/webp', 'image/gif',
+    'application/pdf', 'text/csv',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.ms-excel',
+  ]);
+
   // POST /uploads/presign  { prefix, filename, contentType }
   fastify.post(
     '/uploads/presign',
@@ -47,20 +57,35 @@ export default async function uploadRoutes(fastify) {
       if (!contentType) {
         return reply.code(400).send({ error: 'contentType is required' });
       }
-      const ext = filename.includes('.') ? `.${filename.split('.').pop()}` : '';
+      if (!ALLOWED_DOC_FOLDERS.has(prefix)) {
+        return reply.code(400).send({ error: `prefix must be one of: ${[...ALLOWED_DOC_FOLDERS].join(', ')}` });
+      }
+      if (!ALLOWED_CONTENT_TYPES.has(contentType)) {
+        return reply.code(400).send({ error: 'contentType not allowed' });
+      }
+      // Sanitise the extension: alphanumeric only, so a crafted filename can't smuggle a path or a second dot.
+      const rawExt = filename.includes('.') ? filename.split('.').pop() : '';
+      const ext = /^[a-zA-Z0-9]{1,8}$/.test(rawExt) ? `.${rawExt.toLowerCase()}` : '';
       const key = `${prefix}/${randomUUID()}${ext}`;
       const uploadUrl = await getUploadUrl(key, contentType);
       return { key, uploadUrl };
     },
   );
 
-  // GET /uploads/download-url?key=...  -> time-limited GET URL for a private object
+  // GET /uploads/download-url?key=...  -> time-limited GET URL for a private object.
+  // Only keys under known object folders are allowed, blocking traversal / probing
+  // of arbitrary bucket paths. Staff can read any allowed key; the app tokens too,
+  // but the key namespace here is non-sensitive (product/complaint/COA assets).
   fastify.get(
     '/uploads/download-url',
     { preHandler: fastify.authenticate },
     async (request, reply) => {
       const { key } = request.query ?? {};
       if (!key) return reply.code(400).send({ error: 'key is required' });
+      const folder = String(key).split('/')[0];
+      if (String(key).includes('..') || !ALLOWED_DOC_FOLDERS.has(folder)) {
+        return reply.code(400).send({ error: 'Invalid object key' });
+      }
       return { url: await getDownloadUrl(key) };
     },
   );

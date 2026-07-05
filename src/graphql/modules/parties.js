@@ -141,7 +141,7 @@ export function partyResolvers() {
         const { rows } = await query(
           `SELECT * FROM (
              SELECT d.id::text id, 'DISTRIBUTOR' party_type, d.name, d.phone, d.email, d.gstin, d.state location,
-               d.outstanding + COALESCE((SELECT SUM(total_amount-amount_paid) FROM party_sales WHERE distributor_id=d.id),0) balance,
+               d.outstanding balance,   -- party_sales already folded into outstanding at sale time
                'RECEIVABLE' balance_kind, d.is_active
              FROM distributors d
              UNION ALL
@@ -171,7 +171,7 @@ export function partyResolvers() {
                   (SELECT COUNT(*) FROM vendors)::int vendors,
                   (SELECT COUNT(*) FROM farmers)::int farmers,
                   COALESCE((SELECT SUM(outstanding) FROM distributors),0)
-                    + COALESCE((SELECT SUM(total_amount-amount_paid) FROM party_sales),0)
+                    + COALESCE((SELECT SUM(total_amount-amount_paid) FROM party_sales WHERE farmer_id IS NOT NULL),0)
                     + COALESCE((SELECT SUM(total_amount-amount_paid) FROM invoices WHERE customer_type='FARMER'),0) receivable,
                   COALESCE((SELECT SUM(outstanding) FROM vendors),0) payable`,
         );
@@ -197,7 +197,7 @@ export function partyResolvers() {
         const { rows } = await query(
           `WITH recv AS (
              SELECT d.id::text AS id, 'DISTRIBUTOR' AS party_type, d.name, d.phone, d.email, d.gstin, d.state AS location,
-               d.outstanding + COALESCE((SELECT SUM(total_amount-amount_paid) FROM party_sales WHERE distributor_id=d.id),0) AS balance
+               d.outstanding AS balance   -- party_sales already folded into outstanding
              FROM distributors d
              UNION ALL
              SELECT f.id::text, 'FARMER', f.name, f.phone, f.email, NULL, COALESCE(f.village, f.district),
@@ -332,6 +332,8 @@ export function partyResolvers() {
           for (const l of input.lines) {
             const p = (await client.query('SELECT name, gst_percent FROM products WHERE id=$1', [l.productId])).rows[0];
             if (!p) throw httpError('Product not found', 404);
+            if (!(num(l.quantity) > 0)) throw httpError(`${p.name}: quantity must be positive`, 400);
+            if (num(l.unitPrice) < 0) throw httpError(`${p.name}: unit price cannot be negative`, 400);
             const lineTotal = round2(l.quantity * l.unitPrice);
             const gst = num(p.gst_percent ?? 0);
             subTotal += lineTotal; taxTotal += round2(lineTotal * gst / 100);
@@ -339,6 +341,7 @@ export function partyResolvers() {
           }
           subTotal = round2(subTotal); taxTotal = round2(taxTotal);
           const total = round2(subTotal + taxTotal);
+          if (num(input.amountPaid ?? 0) < 0) throw httpError('Amount paid cannot be negative', 400);
           const paid = Math.min(round2(input.amountPaid ?? 0), total);
 
           // FIFO stock-out per line (prefer named batch, else by expiry) with negative-stock prevention.
@@ -349,6 +352,14 @@ export function partyResolvers() {
             [saleNo, input.partyType, input.partyType === 'DISTRIBUTOR' ? input.partyId : null, input.partyType === 'FARMER' ? input.partyId : null,
               input.warehouseId, subTotal, taxTotal, total, paid, input.paymentMethod ?? null, input.notes ?? null, a.sub],
           )).rows[0];
+
+          // Counter sales on credit add to the distributor's running outstanding, so
+          // the single balance field (used by ledgers, reminders, credit checks) stays
+          // complete. Farmers carry no outstanding column — their dues derive from docs.
+          if (input.partyType === 'DISTRIBUTOR') {
+            const unpaid = round2(total - paid);
+            if (unpaid > 0) await client.query('UPDATE distributors SET outstanding = outstanding + $2 WHERE id=$1', [input.partyId, unpaid]);
+          }
 
           for (const { l, name, gst, lineTotal } of prepared) {
             let remaining = l.quantity;

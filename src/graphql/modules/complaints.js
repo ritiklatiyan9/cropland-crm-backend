@@ -130,7 +130,7 @@ export function complaintResolvers() {
   return {
     Query: {
       complaints: async (_p, { status, category, search, limit }, ctx) => {
-        assertAuth(ctx);
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const { rows } = await query(
           `${SELECT}
            WHERE ($1::text IS NULL OR c.status = $1::complaint_status)
@@ -142,12 +142,12 @@ export function complaintResolvers() {
         return rows.map(map);
       },
       complaint: async (_p, { id }, ctx) => {
-        assertAuth(ctx);
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const { rows } = await query(`${SELECT} WHERE c.id = $1`, [id]);
         return map(rows[0]);
       },
       complaintStats: async (_p, _a, ctx) => {
-        assertAuth(ctx);
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const { rows } = await query(
           `SELECT COUNT(*)::int total,
              COUNT(*) FILTER (WHERE status='OPEN')::int open,

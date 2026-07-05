@@ -164,8 +164,12 @@ export function interest88B({ igst = 0, cgst = 0, sgst = 0 }, days) {
   return { ...i, total: roundGst(i.igst + i.cgst + i.sgst) };
 }
 
-/** Late fee: ₹50/day (₹20/day for nil), capped, per the period. */
-export function lateFee(days, isNil = false, cap = 5000) {
+/**
+ * Late fee u/s 47: ₹50/day (₹20/day for a nil return), capped per the Act —
+ * ₹500 total for nil returns, ₹5,000 otherwise (CGST+SGST combined).
+ */
+export function lateFee(days, isNil = false, cap) {
   const d = Math.max(0, Number(days || 0));
-  return Math.min(cap, d * (isNil ? 20 : 50));
+  const max = cap ?? (isNil ? 500 : 5000);
+  return Math.min(max, d * (isNil ? 20 : 50));
 }

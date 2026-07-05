@@ -8,6 +8,7 @@ import { query, withTransaction } from '../../db/index.js';
 import { assertRole } from '../context.js';
 import { num, isoDate, logActivity } from '../helpers.js';
 import { normGstin as normG, normDocNo, matchKey, classifyPair } from '../../services/gst/calc.js';
+import { cdnAdjustment, partySalesTax } from './gstReturns.js';
 
 export const gstReconTypeDefs = /* GraphQL */ `
   type GstReconImport { id: ID!, source: String!, period: String!, gstin: String, fileName: String, lineCount: Int!, createdAt: DateTime! }
@@ -401,8 +402,15 @@ export function gstReconResolvers() {
 
       imsInbox: async (_p, { period }, ctx) => {
         guard(ctx);
+        // Latest import per source only — every upload re-inserts its docs, so an
+        // unscoped read would duplicate the inbox after a re-import.
         const { rows: docs } = await query(
-          `SELECT * FROM gst_recon_docs WHERE source IN ('GSTR2A','GSTR2B') AND period=$1 ORDER BY ctin, doc_no`,
+          `SELECT d.* FROM gst_recon_docs d
+           WHERE d.import_id IN (
+             SELECT DISTINCT ON (source) id FROM gst_recon_imports
+             WHERE source IN ('GSTR2A','GSTR2B') AND period=$1
+             ORDER BY source, created_at DESC)
+           ORDER BY d.ctin, d.doc_no`,
           [period],
         );
         const s = { total: docs.length, accepted: 0, rejected: 0, pending: 0, noAction: 0, acceptedTax: 0 };
@@ -434,12 +442,23 @@ export function gstReconResolvers() {
       challanReconciliation: async (_p, { period }, ctx) => {
         guard(ctx);
         const { from, to } = periodRange(period);
-        // Liability = net output tax for the period (output − ITC from 2B/books), per head.
+        // Liability mirrors GSTR-3B: invoices ± credit/debit notes + RCM inward
+        // (paid in cash), minus ITC from 2B/books, per head.
         const out = (await query(
           `SELECT COALESCE(SUM(igst),0) igst, COALESCE(SUM(cgst),0) cgst, COALESCE(SUM(sgst),0) sgst
            FROM invoices WHERE bill_type='GST' AND status<>'CANCELLED' AND invoice_date>=$1 AND invoice_date<=$2`,
           [from, to],
         )).rows[0];
+        const cdn = await cdnAdjustment(from, to);
+        const ps = await partySalesTax(from, to);
+        const rcm = (await query(
+          `SELECT COALESCE(SUM(igst),0) igst, COALESCE(SUM(cgst),0) cgst, COALESCE(SUM(sgst),0) sgst
+           FROM purchase_invoices WHERE is_rcm = TRUE AND invoice_date >= $1 AND invoice_date <= $2`,
+          [from, to],
+        )).rows[0];
+        out.igst = num(out.igst) + cdn.igst + num(rcm.igst);
+        out.cgst = num(out.cgst) + cdn.cgst + ps.cgst + num(rcm.cgst);
+        out.sgst = num(out.sgst) + cdn.sgst + ps.sgst + num(rcm.sgst);
         const imp2b = (await query("SELECT id FROM gst_recon_imports WHERE source='GSTR2B' AND period=$1 ORDER BY created_at DESC LIMIT 1", [period])).rows[0];
         let itc = { igst: 0, cgst: 0, sgst: 0 };
         if (imp2b) {
@@ -542,7 +561,11 @@ export function gstReconResolvers() {
         if (!['ACCEPTED', 'REJECTED', 'PENDING', 'NO_ACTION'].includes(act)) throw Object.assign(new Error('Invalid IMS action'), { statusCode: 400 });
         const { rowCount } = await query(
           `UPDATE gst_recon_docs SET ims_action=$2, ims_acted_by=$3, ims_acted_at=now()
-           WHERE source IN ('GSTR2A','GSTR2B') AND period=$1 AND ($4::bool IS NOT TRUE OR match_status='MATCHED')`,
+           WHERE import_id IN (
+             SELECT DISTINCT ON (source) id FROM gst_recon_imports
+             WHERE source IN ('GSTR2A','GSTR2B') AND period=$1
+             ORDER BY source, created_at DESC)
+             AND ($4::bool IS NOT TRUE OR match_status='MATCHED')`,
           [period, act === 'NO_ACTION' ? null : act, actor.sub, onlyMatched ?? false],
         );
         await logActivity(actor.sub, 'BULK_IMS_ACTION', 'gst_recon', null, { period, action: act, count: rowCount });

@@ -118,10 +118,17 @@ export function financeResolvers() {
         );
         const payments = await query('SELECT amount, paid_at AS dt, reference FROM payments WHERE distributor_id = $1', [distributorId]);
         const notes = await query('SELECT note_no, note_type, amount, created_at AS dt FROM credit_debit_notes WHERE distributor_id = $1', [distributorId]);
+        // Direct counter sales also move this distributor's balance, so include them
+        // to keep the ledger closing balance tied to distributors.outstanding.
+        const sales = await query('SELECT sale_no, sale_date AS dt, total_amount, amount_paid, payment_method FROM party_sales WHERE distributor_id = $1', [distributorId]);
 
         const entries = [];
         for (const r of invoices.rows)
           entries.push({ date: isoDate(r.dt), sort: new Date(r.dt).getTime(), type: 'INVOICE', ref: r.invoice_no, particulars: 'Sales invoice', debit: num(r.total_amount), credit: 0 });
+        for (const r of sales.rows) {
+          entries.push({ date: isoDate(r.dt), sort: new Date(r.dt).getTime(), type: 'DIRECT_SALE', ref: r.sale_no, particulars: 'Direct sale', debit: num(r.total_amount), credit: 0 });
+          if (num(r.amount_paid) > 0) entries.push({ date: isoDate(r.dt), sort: new Date(r.dt).getTime(), type: 'PAYMENT', ref: r.sale_no, particulars: `Paid at sale${r.payment_method ? ` (${r.payment_method})` : ''}`, debit: 0, credit: num(r.amount_paid) });
+        }
         for (const r of payments.rows)
           entries.push({ date: isoDate(r.dt), sort: new Date(r.dt).getTime(), type: 'PAYMENT', ref: r.reference || 'Payment', particulars: 'Payment received', debit: 0, credit: num(r.amount) });
         for (const r of notes.rows)

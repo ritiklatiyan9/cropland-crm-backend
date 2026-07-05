@@ -22,7 +22,7 @@ export const gstReturnsTypeDefs = /* GraphQL */ `
   type Gstr1B2bRow { ctin: String!, tradeName: String, invoiceNo: String!, invoiceDate: String!, pos: String, posName: String, invoiceValue: Float!, reverseCharge: String!, invoiceType: String!, rate: Float!, taxable: Float!, igst: Float!, cgst: Float!, sgst: Float!, cess: Float!, total: Float! }
   type Gstr1B2clRow { pos: String!, posName: String, invoiceNo: String!, invoiceDate: String!, invoiceValue: Float!, rate: Float!, taxable: Float!, igst: Float!, cess: Float!, total: Float! }
   type Gstr1B2csRow { supplyType: String!, pos: String!, posName: String, rate: Float!, taxable: Float!, igst: Float!, cgst: Float!, sgst: Float!, cess: Float!, total: Float! }
-  type Gstr1CdnrRow { ctin: String!, tradeName: String, noteNo: String!, noteDate: String!, noteType: String!, refInvoiceNo: String, rate: Float!, taxable: Float!, igst: Float!, cgst: Float!, sgst: Float!, cess: Float!, total: Float! }
+  type Gstr1CdnrRow { ctin: String!, tradeName: String, noteNo: String!, noteDate: String!, noteType: String!, refInvoiceNo: String, pos: String, posName: String, rate: Float!, taxable: Float!, igst: Float!, cgst: Float!, sgst: Float!, cess: Float!, total: Float! }
   type Gstr1HsnRow { hsnCode: String, description: String, uqc: String!, qty: Float!, rate: Float!, taxable: Float!, igst: Float!, cgst: Float!, sgst: Float!, cess: Float!, total: Float! }
   type Gstr1DocRow { docType: String!, fromNo: String, toNo: String, totalCount: Int!, cancelled: Int!, net: Int! }
 
@@ -200,16 +200,109 @@ async function loadInvoiceLines(from, to, supplierStateCode) {
   });
 }
 
+/**
+ * Load direct party sales (over-the-counter) in the period as invoice-like rows
+ * for GSTR-1. These bills charge GST at sale time but live outside `invoices`,
+ * so without this they would silently vanish from the returns. Counter sales
+ * are intra-state: POS = supplier state, CGST/SGST split.
+ */
+async function loadPartySales(from, to, supplierStateCode) {
+  const { rows } = await query(
+    `SELECT s.id, s.sale_no, s.sale_date, s.total_amount, d.gstin d_gstin, COALESCE(d.name, f.name) pname,
+            l.gst_percent rate, SUM(l.line_total) taxable, SUM(l.quantity) qty
+     FROM party_sales s
+     LEFT JOIN distributors d ON d.id = s.distributor_id
+     LEFT JOIN farmers f ON f.id = s.farmer_id
+     JOIN party_sale_lines l ON l.sale_id = s.id
+     WHERE s.sale_date >= $1 AND s.sale_date <= $2
+     GROUP BY s.id, s.sale_no, s.sale_date, s.total_amount, d.gstin, COALESCE(d.name, f.name), l.gst_percent
+     ORDER BY s.sale_date, s.sale_no`,
+    [from, to],
+  );
+  const bySale = new Map();
+  for (const r of rows) {
+    if (!bySale.has(r.id)) {
+      bySale.set(r.id, {
+        id: r.id, invoiceNo: r.sale_no, invoiceDate: isoDate(r.sale_date), invoiceValue: num(r.total_amount) || 0,
+        gstin: r.d_gstin || null, tradeName: r.pname, pos: supplierStateCode, interstate: false, itms: [],
+      });
+    }
+    const taxable = num(r.taxable) || 0;
+    const rate = num(r.rate) || 0;
+    const tax = round2((taxable * rate) / 100);
+    const cgst = round2(tax / 2);
+    bySale.get(r.id).itms.push({
+      rate, taxable: round2(taxable), igst: 0, cgst, sgst: round2(tax - cgst), cess: 0,
+      total: round2(taxable + tax), qty: num(r.qty) || 0,
+    });
+  }
+  return [...bySale.values()];
+}
+
+/**
+ * Load credit/debit notes to registered recipients in a period, with the tax
+ * resolved via calc.computeCdnTax (captured heads preferred, legacy blended-rate
+ * fallback). Shared by GSTR-1 CDNR, GSTR-3B netting and challan reconciliation.
+ */
+export async function loadCdnNotes(from, to) {
+  const { rows } = await query(
+    `SELECT n.note_no, n.note_type, n.amount, n.created_at,
+            n.taxable_value, n.gst_rate, n.cgst, n.sgst, n.igst, n.is_interstate,
+            d.name d_name, d.gstin d_gstin,
+            ri.invoice_no ref_no, ri.is_interstate ri_inter, ri.taxable_value ri_tax, ri.cgst ri_cgst, ri.sgst ri_sgst, ri.igst ri_igst
+     FROM credit_debit_notes n
+     JOIN distributors d ON d.id = n.distributor_id
+     LEFT JOIN invoices ri ON ri.id = n.ref_invoice_id
+     WHERE n.created_at::date >= $1 AND n.created_at::date <= $2
+       AND d.gstin IS NOT NULL
+     ORDER BY n.created_at`,
+    [from, to],
+  );
+  return rows.map((n) => {
+    const hasCaptured = n.taxable_value != null;
+    const tax = computeCdnTax({
+      amount: num(n.amount) || 0,
+      taxable: hasCaptured ? num(n.taxable_value) : null,
+      rate: hasCaptured ? num(n.gst_rate) : null,
+      cgst: hasCaptured ? num(n.cgst) : null, sgst: hasCaptured ? num(n.sgst) : null, igst: hasCaptured ? num(n.igst) : null,
+      refInterstate: hasCaptured ? !!n.is_interstate : !!n.ri_inter,
+      refTaxable: num(n.ri_tax) || 0, refTaxTotal: num(n.ri_cgst) + num(n.ri_sgst) + num(n.ri_igst),
+    });
+    return { gstin: n.d_gstin, name: n.d_name, noteNo: n.note_no, noteType: n.note_type, noteDate: isoDate(n.created_at), refNo: n.ref_no || null, tax };
+  });
+}
+
+/**
+ * Signed CDN aggregate for a period (credit notes negative, debit notes positive)
+ * — the adjustment GSTR-3B 3.1(a) applies on top of invoice totals so 3B ties to
+ * GSTR-1 (B2B/B2CL/B2CS + CDNR).
+ */
+export async function cdnAdjustment(from, to) {
+  const agg = { taxable: 0, igst: 0, cgst: 0, sgst: 0 };
+  for (const n of await loadCdnNotes(from, to)) {
+    const sign = n.noteType === 'CREDIT' ? -1 : 1;
+    agg.taxable += sign * n.tax.taxable;
+    agg.igst += sign * n.tax.igst;
+    agg.cgst += sign * n.tax.cgst;
+    agg.sgst += sign * n.tax.sgst;
+  }
+  return { taxable: round2(agg.taxable), igst: round2(agg.igst), cgst: round2(agg.cgst), sgst: round2(agg.sgst) };
+}
+
 /** Build all GSTR-1 sections for a period. */
 async function buildGstr1(period) {
   const { from, to, label } = parsePeriod(period);
   const { gstin, stateCode: supplierStateCode } = await companyState();
-  const invoices = await loadInvoiceLines(from, to, supplierStateCode);
+  const invoices = [
+    ...await loadInvoiceLines(from, to, supplierStateCode),
+    ...await loadPartySales(from, to, supplierStateCode),
+  ];
 
-  // Aggregate turnover April→period (cur_gt) for the GSTR-1 envelope.
+  // Aggregate turnover April→period (cur_gt) for the GSTR-1 envelope — invoices + direct sales.
   const fyStart = `${Number(from.slice(0, 4)) - (Number(from.slice(5, 7)) >= 4 ? 0 : 1)}-04-01`;
   const curGtRow = (await query(
-    `SELECT COALESCE(SUM(taxable_value),0) gt FROM invoices WHERE status<>'CANCELLED' AND invoice_date >= $1 AND invoice_date <= $2`,
+    `SELECT (SELECT COALESCE(SUM(taxable_value),0) FROM invoices WHERE status<>'CANCELLED' AND invoice_date >= $1 AND invoice_date <= $2)
+          + (SELECT COALESCE(SUM(sub_total),0) FROM party_sales WHERE sale_date >= $1 AND sale_date <= $2) gt`,
     [fyStart, to],
   )).rows[0];
   const curGt = round2(num(curGtRow.gt));
@@ -250,43 +343,22 @@ async function buildGstr1(period) {
   const b2cs = [...b2csMap.values()].map(roundAmt2).sort((a, b) => a.pos.localeCompare(b.pos) || a.rate - b.rate);
 
   // ── Credit / Debit notes (CDNR — to registered recipients) ──
-  // Uses captured tax (taxable_value/gst_rate/heads) when present; else derives a
-  // blended rate from the linked invoice (legacy fallback) — see calc.computeCdnTax.
-  const { rows: notes } = await query(
-    `SELECT n.note_no, n.note_type, n.amount, n.created_at,
-            n.taxable_value, n.gst_rate, n.cgst, n.sgst, n.igst, n.is_interstate,
-            d.name d_name, d.gstin d_gstin,
-            ri.invoice_no ref_no, ri.is_interstate ri_inter, ri.taxable_value ri_tax, ri.cgst ri_cgst, ri.sgst ri_sgst, ri.igst ri_igst
-     FROM credit_debit_notes n
-     JOIN distributors d ON d.id = n.distributor_id
-     LEFT JOIN invoices ri ON ri.id = n.ref_invoice_id
-     WHERE n.created_at::date >= $1 AND n.created_at::date <= $2
-       AND d.gstin IS NOT NULL
-     ORDER BY n.created_at`,
-    [from, to],
-  );
+  const notes = await loadCdnNotes(from, to);
   const cdnr = notes.map((n) => {
-    const hasCaptured = n.taxable_value != null;
-    const t = computeCdnTax({
-      amount: num(n.amount) || 0,
-      taxable: hasCaptured ? num(n.taxable_value) : null,
-      rate: hasCaptured ? num(n.gst_rate) : null,
-      cgst: hasCaptured ? num(n.cgst) : null, sgst: hasCaptured ? num(n.sgst) : null, igst: hasCaptured ? num(n.igst) : null,
-      refInterstate: hasCaptured ? !!n.is_interstate : !!n.ri_inter,
-      refTaxable: num(n.ri_tax) || 0, refTaxTotal: num(n.ri_cgst) + num(n.ri_sgst) + num(n.ri_igst),
-    });
+    const t = n.tax;
+    const pos = stateCodeFromGstin(n.gstin) || supplierStateCode;
     const row = {
-      ctin: n.d_gstin, tradeName: n.d_name, noteNo: n.note_no, noteDate: isoDate(n.created_at),
-      noteType: n.note_type === 'CREDIT' ? 'C' : 'D', refInvoiceNo: n.ref_no || null, rate: t.rate,
+      ctin: n.gstin, tradeName: n.name, noteNo: n.noteNo, noteDate: n.noteDate,
+      noteType: n.noteType === 'CREDIT' ? 'C' : 'D', refInvoiceNo: n.refNo, pos, posName: stateName(pos), rate: t.rate,
       taxable: t.taxable, igst: t.igst, cgst: t.cgst, sgst: t.sgst, cess: 0, total: t.total,
     };
     // Notes affect liability with opposite sign for credit notes; reflect in totals.
-    const sign = n.note_type === 'CREDIT' ? -1 : 1;
+    const sign = n.noteType === 'CREDIT' ? -1 : 1;
     totals.taxable += sign * t.taxable; totals.igst += sign * t.igst; totals.cgst += sign * t.cgst; totals.sgst += sign * t.sgst; totals.total += sign * t.total;
     return row;
   });
 
-  // ── HSN summary (Table 12) ──
+  // ── HSN summary (Table 12) — invoice lines + direct party-sale lines ──
   const { rows: hsnRows } = await query(
     `SELECT ol.hsn_code, COALESCE(NULLIF(ol.uom,''),'NOS') uqc, ol.gst_percent rate, i.is_interstate,
             SUM(ol.quantity) qty, SUM(ol.line_total) taxable, SUM(ol.line_total * ol.gst_percent / 100) tax
@@ -295,7 +367,15 @@ async function buildGstr1(period) {
      WHERE i.bill_type = 'GST' AND i.status <> 'CANCELLED'
        AND i.invoice_date >= $1 AND i.invoice_date <= $2
      GROUP BY ol.hsn_code, COALESCE(NULLIF(ol.uom,''),'NOS'), ol.gst_percent, i.is_interstate
-     ORDER BY ol.hsn_code NULLS LAST, ol.gst_percent`,
+     UNION ALL
+     SELECT p.hsn_code, COALESCE(NULLIF(p.uom,''),'NOS'), psl.gst_percent, FALSE,
+            SUM(psl.quantity), SUM(psl.line_total), SUM(psl.line_total * psl.gst_percent / 100)
+     FROM party_sale_lines psl
+     JOIN party_sales ps ON ps.id = psl.sale_id
+     JOIN products p ON p.id = psl.product_id
+     WHERE ps.sale_date >= $1 AND ps.sale_date <= $2
+     GROUP BY p.hsn_code, COALESCE(NULLIF(p.uom,''),'NOS'), psl.gst_percent
+     ORDER BY 1 NULLS LAST, 3`,
     [from, to],
   );
   const hsnMap = new Map();
@@ -315,8 +395,10 @@ async function buildGstr1(period) {
   const hsn = [...hsnMap.values()].map((h) => ({ ...h, qty: round2(h.qty), ...roundAmt(h) }));
 
   // ── Document issued summary (Table 13) ──
+  // Natural (length-aware) ordering so INV-9 < INV-10 — string MIN/MAX misorders numeric suffixes.
   const { rows: docRows } = await query(
-    `SELECT MIN(invoice_no) from_no, MAX(invoice_no) to_no,
+    `SELECT (array_agg(invoice_no ORDER BY length(invoice_no), invoice_no))[1] from_no,
+            (array_agg(invoice_no ORDER BY length(invoice_no) DESC, invoice_no DESC))[1] to_no,
             COUNT(*)::int total,
             COUNT(*) FILTER (WHERE status = 'CANCELLED')::int cancelled
      FROM invoices WHERE invoice_date >= $1 AND invoice_date <= $2`,
@@ -327,6 +409,17 @@ async function buildGstr1(period) {
     docType: 'Invoices for outward supply', fromNo: dr.from_no, toNo: dr.to_no,
     totalCount: dr.total, cancelled: dr.cancelled, net: dr.total - dr.cancelled,
   }] : [];
+  // Direct party-sale bills are their own document series (PS-…).
+  const psDoc = (await query(
+    `SELECT (array_agg(sale_no ORDER BY length(sale_no), sale_no))[1] from_no,
+            (array_agg(sale_no ORDER BY length(sale_no) DESC, sale_no DESC))[1] to_no,
+            COUNT(*)::int total
+     FROM party_sales WHERE sale_date >= $1 AND sale_date <= $2`,
+    [from, to],
+  )).rows[0];
+  if ((psDoc?.total || 0) > 0) {
+    docs.push({ docType: 'Invoices for outward supply', fromNo: psDoc.from_no, toNo: psDoc.to_no, totalCount: psDoc.total, cancelled: 0, net: psDoc.total });
+  }
 
   return {
     period, periodLabel: label, gstin, fromDate: from, toDate: to, generatedAt: new Date(), curGt,
@@ -378,12 +471,12 @@ function gstr1ToPortal(r) {
     txval: row.taxable, iamt: row.igst, camt: row.cgst, samt: row.sgst, csamt: row.cess,
   }));
 
-  // CDNR grouped by CTIN.
+  // CDNR grouped by CTIN. pos/rchrg/inv_typ are mandatory on the portal schema.
   const cdnrByCtin = new Map();
   for (const row of r.cdnr) {
     if (!cdnrByCtin.has(row.ctin)) cdnrByCtin.set(row.ctin, []);
     cdnrByCtin.get(row.ctin).push({
-      ntty: row.noteType, nt_num: row.noteNo, nt_dt: dmy(row.noteDate), val: row.total,
+      ntty: row.noteType, nt_num: row.noteNo, nt_dt: dmy(row.noteDate), pos: row.pos, rchrg: 'N', inv_typ: 'R', val: row.total,
       itms: [{ num: 1, itm_det: { rt: row.rate, txval: row.taxable, iamt: row.igst, camt: row.cgst, samt: row.sgst, csamt: row.cess } }],
     });
   }
@@ -420,13 +513,20 @@ async function buildGstr3b(period) {
   const { gstin } = await companyState();
   const L = (code, lbl, a = {}) => ({ code, label: lbl, taxable: a.taxable || 0, igst: a.igst || 0, cgst: a.cgst || 0, sgst: a.sgst || 0, cess: a.cess || 0, total: (a.igst || 0) + (a.cgst || 0) + (a.sgst || 0) + (a.cess || 0) + (a.includeTaxableInTotal ? a.taxable || 0 : 0) });
 
-  // 3.1(a) Outward taxable.
+  // 3.1(a) Outward taxable, net of credit/debit notes so 3B ties to GSTR-1
+  // (invoices + CDNR) — the first consistency check any CA runs.
   const out = (await query(
     `SELECT COALESCE(SUM(taxable_value),0) taxable, COALESCE(SUM(igst),0) igst, COALESCE(SUM(cgst),0) cgst, COALESCE(SUM(sgst),0) sgst
      FROM invoices WHERE bill_type='GST' AND status<>'CANCELLED' AND invoice_date >= $1 AND invoice_date <= $2`,
     [from, to],
   )).rows[0];
-  const o31a = { code: '3.1(a)', label: 'Outward taxable supplies (other than zero rated, nil & exempted)', taxable: num(out.taxable), igst: num(out.igst), cgst: num(out.cgst), sgst: num(out.sgst), cess: 0, total: 0 };
+  const cdn = await cdnAdjustment(from, to);
+  const ps = await partySalesTax(from, to);
+  const o31a = {
+    code: '3.1(a)', label: 'Outward taxable supplies (other than zero rated, nil & exempted)',
+    taxable: num(out.taxable) + cdn.taxable + ps.taxable, igst: num(out.igst) + cdn.igst,
+    cgst: num(out.cgst) + cdn.cgst + ps.cgst, sgst: num(out.sgst) + cdn.sgst + ps.sgst, cess: 0, total: 0,
+  };
 
   // 3.1(b) Zero-rated (exports/SEZ) — not tracked yet; reported as 0.
   const o31b = L('3.1(b)', 'Outward zero-rated supplies (exports / SEZ)');
@@ -501,12 +601,14 @@ async function buildGstr3b(period) {
   const balance = netLiability({ igst: taxPayable.igst, cgst: taxPayable.cgst, sgst: taxPayable.sgst }, challanPaid);
   const netPayable = { code: 'NET', label: 'Balance payable in cash', taxable: 0, igst: balance.igst, cgst: balance.cgst, sgst: balance.sgst, cess: 0, total: round2(balance.igst + balance.cgst + balance.sgst) };
 
-  // 5.1 Interest (Rule 88B) + late fee — based on days past the due date.
+  // 5.1 Interest (Rule 88B: 18% p.a. on the net CASH liability paid late — the
+  // balance after ITC and challans, not the gross payable) + late fee u/s 47.
   const due = gstr3bDueDate(period);
   const daysLate = Math.max(0, Math.floor((Date.now() - due.getTime()) / 86400000));
-  const interestObj = interest88B({ igst: taxPayable.igst, cgst: taxPayable.cgst, sgst: taxPayable.sgst }, daysLate);
+  const interestObj = interest88B({ igst: balance.igst, cgst: balance.cgst, sgst: balance.sgst }, daysLate);
   const interest = { code: '5.1', label: `Interest @18% (${daysLate} day(s) late)`, taxable: 0, igst: interestObj.igst, cgst: interestObj.cgst, sgst: interestObj.sgst, cess: 0, total: interestObj.total };
-  const isNil = o31a.taxable === 0 && o31a.igst === 0 && o31a.cgst === 0 && o31a.sgst === 0 && o31c.taxable === 0;
+  // Nil return = no outward supplies (incl. exempt & RCM inward liability) at all.
+  const isNil = o31a.taxable === 0 && o31a.igst === 0 && o31a.cgst === 0 && o31a.sgst === 0 && o31c.taxable === 0 && o31d.taxable === 0;
   const lateFeeAmt = lateFee(daysLate, isNil);
 
   o31a.total = round2(o31a.taxable + o31a.igst + o31a.cgst + o31a.sgst);
@@ -552,6 +654,21 @@ function gstr3bToPortal(r) {
   };
 }
 
+/**
+ * Direct party-sale tax for a period (counter sales ⇒ intra-state CGST/SGST).
+ * Shared by GSTR-3B 3.1(a) and challan reconciliation so both tie to GSTR-1.
+ */
+export async function partySalesTax(from, to) {
+  const r = (await query(
+    `SELECT COALESCE(SUM(sub_total),0) taxable, COALESCE(SUM(tax_total),0) tax
+     FROM party_sales WHERE sale_date >= $1 AND sale_date <= $2`,
+    [from, to],
+  )).rows[0];
+  const tax = num(r.tax);
+  const cgst = round2(tax / 2);
+  return { taxable: round2(num(r.taxable)), cgst, sgst: round2(tax - cgst) };
+}
+
 /** Build the portal-ready payload + summary for a return type. */
 async function buildPayload(returnType, period) {
   const type = String(returnType).toUpperCase();
@@ -571,7 +688,22 @@ export function gstReturnsResolvers() {
       validateGstReturn: async (_p, { returnType, period }, ctx) => {
         guard(ctx);
         const { type, payload } = await buildPayload(returnType, period);
-        return validatePayload(type, payload);
+        const v = validatePayload(type, payload);
+        // Cross-return check (the first thing a CA reconciles): GSTR-3B 3.1(a)
+        // must tie to GSTR-1 (B2B + B2CL + B2CS ± CDNR) for the same period.
+        if (type === 'GSTR3B') {
+          const r1 = await buildGstr1(period);
+          const a = payload.sup_details?.osup_det || {};
+          const tax3b = round2(num(a.iamt) + num(a.camt) + num(a.samt));
+          const tax1 = round2(r1.totals.igst + r1.totals.cgst + r1.totals.sgst);
+          if (Math.abs(round2(num(a.txval)) - r1.totals.taxable) > 1) {
+            v.warnings.push(`GSTR-1 ↔ 3B mismatch: 3.1(a) taxable ₹${round2(num(a.txval))} ≠ GSTR-1 taxable ₹${r1.totals.taxable}`);
+          }
+          if (Math.abs(tax3b - tax1) > 1) {
+            v.warnings.push(`GSTR-1 ↔ 3B mismatch: 3.1(a) tax ₹${tax3b} ≠ GSTR-1 tax ₹${tax1}`);
+          }
+        }
+        return v;
       },
       gstFilingProvider: async (_p, _a, ctx) => { guard(ctx); return getGstProviderName(); },
 

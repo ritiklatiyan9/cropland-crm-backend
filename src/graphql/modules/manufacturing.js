@@ -394,9 +394,11 @@ export function manufacturingResolvers() {
 
       createProductionOrder: async (_p, { input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
+        if (!(num(input.plannedQuantity) > 0)) throw httpError('Planned quantity must be positive', 400);
         return withTransaction(async (client) => {
           const prod = (await client.query('SELECT id FROM products WHERE id=$1', [input.productId])).rows[0];
           if (!prod) throw httpError('Product not found', 404);
+          if (!(await client.query('SELECT id FROM warehouses WHERE id=$1', [input.warehouseId])).rows[0]) throw httpError('Warehouse not found', 404);
           const bom = (await client.query('SELECT id FROM bom WHERE product_id=$1 AND is_active ORDER BY version DESC LIMIT 1', [input.productId])).rows[0];
           if (!bom) throw httpError('No active BOM for this product — define a Bill of Materials first', 400);
           const prodNo = `MO-${String((await client.query("SELECT nextval('prod_seq') n")).rows[0].n).padStart(5, '0')}`;
@@ -452,6 +454,7 @@ export function manufacturingResolvers() {
       completeProduction: async (_p, { input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
         if (!['PASS', 'FAIL', 'HOLD'].includes(input.qcStatus)) throw httpError('qcStatus must be PASS, FAIL or HOLD', 400);
+        if (input.qcStatus === 'PASS' && !(num(input.producedQuantity) > 0)) throw httpError('Produced quantity must be positive for a PASS', 400);
         return withTransaction(async (client) => {
           const po = (await client.query('SELECT * FROM production_orders WHERE id=$1 FOR UPDATE', [input.productionOrderId])).rows[0];
           if (!po) throw httpError('Production order not found', 404);

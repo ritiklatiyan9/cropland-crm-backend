@@ -250,6 +250,8 @@ export function procurementResolvers() {
             const pr = await client.query('SELECT * FROM products WHERE id=$1', [l.productId]);
             const p = pr.rows[0];
             if (!p) throw httpError('Product not found', 404);
+            if (!(num(l.quantity) > 0)) throw httpError(`${p.name}: quantity must be positive`, 400);
+            if (num(l.unitCost) < 0) throw httpError(`${p.name}: unit cost cannot be negative`, 400);
             const lineTotal = round2(l.quantity * l.unitCost);
             const gst = num(p.gst_percent ?? 0);
             subTotal += lineTotal; taxTotal += round2(lineTotal * gst / 100);
@@ -311,6 +313,10 @@ export function procurementResolvers() {
             if (rl.quantity <= 0) continue;
             const line = (await client.query('SELECT * FROM purchase_order_lines WHERE id=$1 AND po_id=$2 FOR UPDATE', [rl.poLineId, po.id])).rows[0];
             if (!line) throw httpError('PO line not found', 404);
+            // Never receive more than was ordered on a line.
+            if (num(line.received_qty) + num(rl.quantity) > num(line.quantity)) {
+              throw httpError(`${line.product_name}: receiving ${rl.quantity} exceeds outstanding ${num(line.quantity) - num(line.received_qty)} of ${num(line.quantity)} ordered`, 400);
+            }
             // create/find batch, add stock, log movement IN
             const batch = await client.query(
               `INSERT INTO batches (product_id, batch_number, manufacturing_date, expiry_date)
@@ -344,8 +350,10 @@ export function procurementResolvers() {
       recordPurchaseBill: async (_p, { poId, billNo, invoiceDate, isRcm, itcEligibility }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
         return withTransaction(async (client) => {
-          const po = (await client.query('SELECT * FROM purchase_orders WHERE id=$1', [poId])).rows[0];
+          const po = (await client.query('SELECT * FROM purchase_orders WHERE id=$1 FOR UPDATE', [poId])).rows[0];
           if (!po) throw httpError('PO not found', 404);
+          if (po.status === 'CANCELLED') throw httpError('Cannot bill a cancelled purchase order', 400);
+          if (po.status === 'DRAFT') throw httpError('Approve (and receive) the purchase order before billing it', 400);
           const exists = await client.query('SELECT id FROM purchase_invoices WHERE po_id=$1', [poId]);
           if (exists.rows[0]) throw httpError('A bill already exists for this PO', 409);
           const internalNo = `PINV-${fy(invoiceDate)}-${String((await client.query("SELECT nextval('pbill_seq') n")).rows[0].n).padStart(5, '0')}`;
@@ -374,12 +382,21 @@ export function procurementResolvers() {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
         if (input.amount <= 0) throw httpError('Amount must be positive', 400);
         return withTransaction(async (client) => {
-          const v = await client.query('SELECT id FROM vendors WHERE id=$1', [input.vendorId]);
+          const v = await client.query('SELECT id FROM vendors WHERE id=$1 FOR UPDATE', [input.vendorId]);
           if (!v.rows[0]) throw httpError('Vendor not found', 404);
+          if (input.purchaseInvoiceId) {
+            // The bill must belong to this vendor (else a payment to A settles B's bill),
+            // and the payment must not exceed the outstanding balance on that bill.
+            const bill = (await client.query('SELECT vendor_id, total_amount, amount_paid FROM purchase_invoices WHERE id=$1 FOR UPDATE', [input.purchaseInvoiceId])).rows[0];
+            if (!bill) throw httpError('Purchase bill not found', 404);
+            if (bill.vendor_id !== input.vendorId) throw httpError('That bill belongs to a different vendor', 400);
+            const due = round2(num(bill.total_amount) - num(bill.amount_paid));
+            if (round2(input.amount) > due + 0.01) throw httpError(`Payment ₹${input.amount} exceeds balance due ₹${due} on this bill`, 400);
+            await client.query('UPDATE purchase_invoices SET amount_paid = amount_paid + $2 WHERE id=$1', [input.purchaseInvoiceId, input.amount]);
+          }
           await client.query(
             `INSERT INTO vendor_payments (vendor_id, purchase_invoice_id, amount, method, reference, created_by) VALUES ($1,$2,$3,$4,$5,$6)`,
             [input.vendorId, input.purchaseInvoiceId ?? null, input.amount, input.method ?? null, input.reference ?? null, a.sub]);
-          if (input.purchaseInvoiceId) await client.query('UPDATE purchase_invoices SET amount_paid = amount_paid + $2 WHERE id=$1', [input.purchaseInvoiceId, input.amount]);
           await client.query('UPDATE vendors SET outstanding = GREATEST(outstanding - $2, 0) WHERE id=$1', [input.vendorId, input.amount]);
           await logActivity(a.sub, 'VENDOR_PAYMENT', 'vendor', input.vendorId, { amount: input.amount });
           return true;

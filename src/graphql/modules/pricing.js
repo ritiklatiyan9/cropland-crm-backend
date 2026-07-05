@@ -114,6 +114,16 @@ const mapScheme = (r) =>
     createdAt: r.created_at,
   };
 
+// Reject rules that would produce a negative or nonsensical price before they
+// reach Order-to-Cash pricing.
+function assertValidRule(i) {
+  if (num(i.price) < 0) throw httpError('Price cannot be negative', 400);
+  const d = num(i.discountPct ?? 0);
+  if (d < 0 || d > 100) throw httpError('Discount must be between 0 and 100%', 400);
+  if (i.minQuantity != null && num(i.minQuantity) < 0) throw httpError('Minimum quantity cannot be negative', 400);
+  if (i.validFrom && i.validTo && i.validFrom > i.validTo) throw httpError('valid-from date is after valid-to date', 400);
+}
+
 const ruleValues = (i) => [
   i.productId,
   i.scope,
@@ -177,7 +187,8 @@ export function pricingResolvers() {
         const rule = rows[0];
         const rulePrice = rule ? num(rule.price) : basePrice;
         const discountPct = rule ? num(rule.discount_pct) : 0;
-        const unitPrice = Math.round(rulePrice * (1 - discountPct / 100) * 100) / 100;
+        // Clamp at 0 — legacy rules may carry an out-of-range discount.
+        const unitPrice = Math.max(0, Math.round(rulePrice * (1 - discountPct / 100) * 100) / 100);
         return {
           productId,
           basePrice,
@@ -191,6 +202,7 @@ export function pricingResolvers() {
     Mutation: {
       createPriceRule: async (_p, { input }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        assertValidRule(input);
         const { rows } = await query(
           `INSERT INTO price_rules
              (product_id, scope, state, district, dealer_tier, price, min_quantity, discount_pct, valid_from, valid_to)
@@ -202,6 +214,7 @@ export function pricingResolvers() {
       },
       updatePriceRule: async (_p, { id, input }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        assertValidRule(input);
         const { rows } = await query(
           `UPDATE price_rules SET
              product_id=$2, scope=$3, state=$4, district=$5, dealer_tier=$6, price=$7,

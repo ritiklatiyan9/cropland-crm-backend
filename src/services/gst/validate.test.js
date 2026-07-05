@@ -62,6 +62,78 @@ test('GSTR-3B: missing osup_det ⇒ error', () => {
   assert.ok(r.errors.some((e) => /osup_det/.test(e)));
 });
 
+test('GSTR-1: invoice number over 16 chars ⇒ error', () => {
+  const p = JSON.parse(JSON.stringify(goodB2b));
+  p.b2b[0].inv[0].inum = 'INV/2026/000000000123';
+  const r = validateGstr1Payload(p);
+  assert.ok(r.errors.some((e) => /max 16 chars/.test(e)));
+});
+
+test('GSTR-1: duplicate invoice number ⇒ error', () => {
+  const p = JSON.parse(JSON.stringify(goodB2b));
+  p.b2b[0].inv.push(JSON.parse(JSON.stringify(p.b2b[0].inv[0])));
+  const r = validateGstr1Payload(p);
+  assert.ok(r.errors.some((e) => /duplicate invoice number/.test(e)));
+});
+
+test('GSTR-1: recipient GSTIN = supplier GSTIN ⇒ self-invoice error', () => {
+  const p = JSON.parse(JSON.stringify(goodB2b));
+  p.b2b[0].ctin = p.gstin;
+  const r = validateGstr1Payload(p);
+  assert.ok(r.errors.some((e) => /self-invoice/.test(e)));
+});
+
+test('GSTR-1: IGST charged with POS = supplier state ⇒ warning', () => {
+  const p = JSON.parse(JSON.stringify(goodB2b));
+  p.b2b[0].inv[0].pos = '27'; // same as supplier GSTIN state
+  const r = validateGstr1Payload(p);
+  assert.ok(r.warnings.some((w) => /IGST charged but POS/.test(w)));
+});
+
+test('GSTR-1: invoice dated after the return period ⇒ error', () => {
+  const p = JSON.parse(JSON.stringify(goodB2b));
+  p.b2b[0].inv[0].idt = '15-07-2026'; // fp is 062026
+  const r = validateGstr1Payload(p);
+  assert.ok(r.errors.some((e) => /after the return period/.test(e)));
+});
+
+test('GSTR-1: malformed HSN ⇒ error, 4-digit HSN ⇒ warning', () => {
+  const p = JSON.parse(JSON.stringify(goodB2b));
+  p.hsn = { data: [
+    { num: 1, hsn_sc: '31A5', uqc: 'KGS', qty: 1, rt: 18, txval: 500, iamt: 90, camt: 0, samt: 0, csamt: 0 },
+    { num: 2, hsn_sc: '3105', uqc: 'KGS', qty: 1, rt: 18, txval: 500, iamt: 90, camt: 0, samt: 0, csamt: 0 },
+  ] };
+  const r = validateGstr1Payload(p);
+  assert.ok(r.errors.some((e) => /must be 4, 6 or 8 numeric digits/.test(e)));
+  assert.ok(r.warnings.some((w) => /4-digit code/.test(w)));
+});
+
+test('GSTR-1: HSN summary not tying to sections ⇒ warning', () => {
+  const p = JSON.parse(JSON.stringify(goodB2b));
+  p.hsn = { data: [{ num: 1, hsn_sc: '310510', uqc: 'KGS', qty: 1, rt: 18, txval: 400, iamt: 72, camt: 0, samt: 0, csamt: 0 }] };
+  const r = validateGstr1Payload(p); // sections taxable = 1000, hsn = 400
+  assert.ok(r.warnings.some((w) => /HSN summary taxable/.test(w)));
+});
+
+test('GSTR-1: CDNR note without pos ⇒ error', () => {
+  const p = JSON.parse(JSON.stringify(goodB2b));
+  p.cdnr = [{ ctin: '29AAACM5678G1Z4', nt: [{ ntty: 'C', nt_num: 'CN1', nt_dt: '15-06-2026', val: 118,
+    itms: [{ num: 1, itm_det: { rt: 18, txval: 100, iamt: 18, camt: 0, samt: 0, csamt: 0 } }] }] }];
+  const r = validateGstr1Payload(p);
+  assert.ok(r.errors.some((e) => /CDNR CN1: pos/.test(e)));
+});
+
+test('GSTR-3B: negative 3.1(a) allowed as warning, negative elsewhere ⇒ error', () => {
+  const p = {
+    gstin: '27AAACM1234F1ZY', ret_period: '062026',
+    sup_details: { osup_det: { txval: -500, iamt: -90 }, isup_rev: { txval: -10 } },
+    itc_elg: { itc_avl: [{ iamt: 0 }], itc_rev: [{ iamt: 0 }], itc_net: { iamt: 0 } },
+  };
+  const r = validateGstr3bPayload(p);
+  assert.ok(r.warnings.some((w) => /osup_det.txval is negative/.test(w)));
+  assert.ok(r.errors.some((e) => /isup_rev.txval is negative/.test(e)));
+});
+
 test('GSTR-3B: net ITC mismatch ⇒ warning', () => {
   const p = {
     gstin: '27AAACM1234F1ZY', ret_period: '062026',

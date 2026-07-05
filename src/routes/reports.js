@@ -19,11 +19,15 @@ export default async function reportRoutes(fastify) {
     };
   }
 
-  fastify.get('/api/reports/balance-sheet', { preHandler: fastify.authenticate }, async (request) => {
+  // Financial statements are staff-only — a farmer/distributor app token (valid on
+  // the same JWT) must NOT read the company balance sheet / P&L / receivables.
+  const staffOnly = fastify.requireRole('SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+
+  fastify.get('/api/reports/balance-sheet', { preHandler: staffOnly }, async (request) => {
     return buildBalanceSheet(parseOpts(request));
   });
 
-  fastify.get('/api/reports/profit-loss', { preHandler: fastify.authenticate }, async (request) => {
+  fastify.get('/api/reports/profit-loss', { preHandler: staffOnly }, async (request) => {
     return buildProfitLoss(parseOpts(request));
   });
 
@@ -47,12 +51,12 @@ export default async function reportRoutes(fastify) {
   }
 
   // JSON read model (the canonical machine-readable format).
-  fastify.get('/api/reports/aging', { preHandler: fastify.authenticate }, async (request) => {
+  fastify.get('/api/reports/aging', { preHandler: staffOnly }, async (request) => {
     return buildAgingReport(parseAgingOpts(request));
   });
 
   // Same payload, but as a downloadable .json attachment (for archival / sharing).
-  fastify.get('/api/reports/aging.json', { preHandler: fastify.authenticate }, async (request, reply) => {
+  fastify.get('/api/reports/aging.json', { preHandler: staffOnly }, async (request, reply) => {
     const report = await buildAgingReport(parseAgingOpts(request));
     const fname = `aging-${report.meta.reportType.toLowerCase()}_as-on_${report.meta.asOn}.json`;
     reply.header('Content-Type', 'application/json; charset=utf-8');

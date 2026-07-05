@@ -39,6 +39,7 @@ import { gstReconTypeDefs } from './modules/gstRecon.js';
 import { gstUtilsTypeDefs } from './modules/gstUtils.js';
 import { msmeTypeDefs } from './modules/msme.js';
 import { agingTypeDefs } from './modules/aging.js';
+import { adminDataTypeDefs } from './modules/adminData.js';
 
 const baseTypeDefs = /* GraphQL */ `
   scalar DateTime
@@ -90,4 +91,5 @@ export const schema = [
   gstUtilsTypeDefs,
   msmeTypeDefs,
   agingTypeDefs,
+  adminDataTypeDefs,
 ].join('\n');

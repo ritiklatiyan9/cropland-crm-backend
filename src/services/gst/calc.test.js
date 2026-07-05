@@ -100,4 +100,5 @@ test('lateFee: 50/day normal, 20/day nil, capped', () => {
   assert.equal(lateFee(10), 500);
   assert.equal(lateFee(10, true), 200);
   assert.equal(lateFee(1000), 5000); // cap
+  assert.equal(lateFee(1000, true), 500); // nil-return cap u/s 47 is ₹500
 });

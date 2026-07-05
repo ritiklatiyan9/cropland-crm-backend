@@ -299,7 +299,7 @@ export function aiResolvers() {
   return {
     Query: {
       cropDiagnoses: async (_p, { search, severity, page, pageSize }, ctx) => {
-        assertAuth(ctx);
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const offset = (page - 1) * pageSize;
         const sevFilter = severity && severity !== 'ALL' ? severity : null;
         const searchTerm = search ?? null;
@@ -357,12 +357,12 @@ export function aiResolvers() {
         };
       },
       cropDiagnosis: async (_p, { id }, ctx) => {
-        assertAuth(ctx);
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const { rows } = await query('SELECT d.*, f.name farmer_name FROM crop_diagnoses d LEFT JOIN farmers f ON f.id=d.farmer_id WHERE d.id=$1', [id]);
         return mapDiag(rows[0]);
       },
       advisories: async (_p, { status, limit }, ctx) => {
-        assertAuth(ctx);
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const { rows } = await query(
           `SELECT a.*, f.name farmer_name FROM advisories a LEFT JOIN farmers f ON f.id = a.farmer_id
            WHERE ($1::text IS NULL OR a.status=$1) ORDER BY a.created_at DESC LIMIT $2`,
@@ -371,7 +371,7 @@ export function aiResolvers() {
         return rows.map(mapAdvisory);
       },
       crmLeads: async (_p, { status, limit }, ctx) => {
-        assertAuth(ctx);
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const { rows } = await query(
           `SELECT l.*, f.name farmer_name, f.phone farmer_phone, u.name assigned_name
            FROM crm_leads l LEFT JOIN farmers f ON f.id = l.farmer_id LEFT JOIN users u ON u.id = l.assigned_to

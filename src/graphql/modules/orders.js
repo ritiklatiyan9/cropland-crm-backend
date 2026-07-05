@@ -5,6 +5,7 @@
 import { query, withTransaction } from '../../db/index.js';
 import { assertAuth, assertRole } from '../context.js';
 import { httpError, logActivity, num, isoDate } from '../helpers.js';
+import { resolveStateCode } from '../../services/gst/stateCodes.js';
 import { mapDistributor } from './distributors.js';
 import { mapCompany } from './company.js';
 
@@ -396,6 +397,35 @@ const mapInvoice = (r) =>
 
 const round2 = (n) => Math.round(n * 100) / 100;
 
+/** Reject malformed order/sale lines before they hit totals or the DB. */
+function assertValidLine(l, ctx = 'Line') {
+  if (!(num(l.quantity) > 0)) throw httpError(`${ctx}: quantity must be positive`, 400);
+  if (l.unitPrice != null && num(l.unitPrice) < 0) throw httpError(`${ctx}: unit price cannot be negative`, 400);
+  const disc = num(l.discountPct ?? 0);
+  if (disc < 0 || disc > 100) throw httpError(`${ctx}: discount must be between 0 and 100%`, 400);
+}
+
+/**
+ * Reverse loyalty coins earned from an order (on cancel/delete) so referral
+ * points can't be farmed by placing and cancelling orders.
+ */
+async function reverseOrderLoyalty(client, orderId, actorSub, why) {
+  // Net of EARN minus any prior ADJUST reversal, so cancel-then-delete can't claw back twice.
+  const { rows } = await client.query(
+    "SELECT farmer_id, COALESCE(SUM(points),0) pts FROM loyalty_transactions WHERE ref_order_id=$1 AND type IN ('EARN','ADJUST') GROUP BY farmer_id",
+    [orderId],
+  );
+  for (const r of rows) {
+    const pts = num(r.pts);
+    if (pts <= 0) continue;
+    await client.query('UPDATE farmers SET points_balance = GREATEST(points_balance - $2, 0) WHERE id = $1', [r.farmer_id, pts]);
+    await client.query(
+      "INSERT INTO loyalty_transactions (farmer_id, points, type, note, ref_order_id, created_by) VALUES ($1,$2,'ADJUST',$3,$4,$5)",
+      [r.farmer_id, -pts, why, orderId, actorSub],
+    );
+  }
+}
+
 // Resolve an order/invoice customer (distributor or farmer) into a generic shape.
 async function resolveCustomer(customerType, distributorId, farmerId) {
   if (customerType === 'FARMER' && farmerId) {
@@ -688,6 +718,7 @@ export function orderResolvers() {
             const pr = await client.query('SELECT * FROM products WHERE id = $1', [l.productId]);
             const p = pr.rows[0];
             if (!p) throw httpError('Product not found', 404);
+            assertValidLine(l, p.name);
             const defaultPrice = customerType === 'FARMER'
               ? num(p.mrp ?? p.dealer_price ?? p.distributor_price ?? 0)
               : num(p.distributor_price ?? p.dealer_price ?? p.mrp ?? 0);
@@ -805,6 +836,7 @@ export function orderResolvers() {
         // Credit-limit check applies to distributors only; farmers are billed B2C (no credit line).
         if (ord.rows[0].customer_type !== 'FARMER' && ord.rows[0].distributor_id) {
           const dist = await query('SELECT * FROM distributors WHERE id = $1', [ord.rows[0].distributor_id]);
+          if (!dist.rows[0]) throw httpError('Distributor on this order no longer exists', 404);
           const limit = num(dist.rows[0].credit_limit);
           const exposure = num(dist.rows[0].outstanding) + num(ord.rows[0].total_amount);
           if (limit > 0 && exposure > limit) {
@@ -874,7 +906,12 @@ export function orderResolvers() {
 
           if (type === 'GST') {
             // GST split: intra-state -> CGST+SGST, inter-state -> IGST.
-            interstate = Boolean(company?.state && buyerState && company.state.trim().toLowerCase() !== buyerState.trim().toLowerCase());
+            // Prefer GSTIN state codes (authoritative) over free-text state names.
+            const supplierCode = resolveStateCode({ gstin: company?.gstin, stateName: company?.state });
+            const buyerCode = isFarmer ? supplierCode : resolveStateCode({ gstin: dist?.gstin, stateName: dist?.state });
+            interstate = supplierCode && buyerCode
+              ? supplierCode !== buyerCode
+              : Boolean(company?.state && buyerState && company.state.trim().toLowerCase() !== buyerState.trim().toLowerCase());
             const tax = num(order.tax_total);
             cgst = interstate ? 0 : round2(tax / 2);
             sgst = interstate ? 0 : round2(tax - cgst);
@@ -911,6 +948,11 @@ export function orderResolvers() {
         return withTransaction(async (client) => {
           const inv = await client.query('SELECT * FROM invoices WHERE id = $1 FOR UPDATE', [input.invoiceId]);
           if (!inv.rows[0]) throw httpError('Invoice not found', 404);
+          if (inv.rows[0].status === 'CANCELLED') throw httpError('Cannot record a payment against a cancelled invoice', 400);
+          // Never allow paying more than what is due — overpayment silently corrupts
+          // the invoice balance and the distributor outstanding.
+          const due = round2(num(inv.rows[0].total_amount) - num(inv.rows[0].amount_paid));
+          if (round2(input.amount) > due + 0.01) throw httpError(`Payment ₹${input.amount} exceeds balance due ₹${due}`, 400);
           await client.query('UPDATE invoices SET amount_paid = amount_paid + $2 WHERE id = $1', [input.invoiceId, input.amount]);
           if (inv.rows[0].distributor_id) await client.query('UPDATE distributors SET outstanding = GREATEST(outstanding - $2, 0) WHERE id = $1', [inv.rows[0].distributor_id, input.amount]);
           const pay = await client.query(
@@ -926,26 +968,37 @@ export function orderResolvers() {
 
       updateOrderStatus: async (_p, { id, status }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
-        const allowed = ['DISPATCHED', 'DELIVERED'];
-        if (!allowed.includes(status)) throw httpError('Status must be DISPATCHED or DELIVERED', 400);
+        // Enforce the lifecycle: dispatch requires an invoice; delivery requires dispatch
+        // (or straight from invoiced for self-pickup). Never off a cancelled/unbilled order.
+        const FROM = { DISPATCHED: ['INVOICED'], DELIVERED: ['INVOICED', 'DISPATCHED'] };
+        if (!FROM[status]) throw httpError('Status must be DISPATCHED or DELIVERED', 400);
+        const cur = (await query('SELECT status FROM orders WHERE id = $1', [id])).rows[0];
+        if (!cur) throw httpError('Order not found', 404);
+        if (!FROM[status].includes(cur.status)) {
+          throw httpError(`Cannot mark a ${cur.status} order ${status} — it must be ${FROM[status].join(' or ')} first`, 400);
+        }
         const { rows } = await query(
           'UPDATE orders SET status = $2::order_status, updated_at = now() WHERE id = $1 RETURNING *',
           [id, status],
         );
-        if (!rows[0]) throw httpError('Order not found', 404);
         await logActivity(actor.sub, 'ORDER_STATUS', 'order', id, { status });
         return mapOrder(rows[0]);
       },
 
       cancelOrder: async (_p, { id }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
-        const ord = await query('SELECT status FROM orders WHERE id = $1', [id]);
-        if (!ord.rows[0]) throw httpError('Order not found', 404);
-        if (['INVOICED', 'DISPATCHED', 'DELIVERED'].includes(ord.rows[0].status))
-          throw httpError('Cannot cancel an invoiced/dispatched order', 400);
-        const { rows } = await query("UPDATE orders SET status='CANCELLED', updated_at=now() WHERE id=$1 RETURNING *", [id]);
-        await logActivity(actor.sub, 'CANCEL_ORDER', 'order', id);
-        return mapOrder(rows[0]);
+        return withTransaction(async (client) => {
+          const ord = await client.query('SELECT status FROM orders WHERE id = $1 FOR UPDATE', [id]);
+          if (!ord.rows[0]) throw httpError('Order not found', 404);
+          if (['INVOICED', 'DISPATCHED', 'DELIVERED'].includes(ord.rows[0].status))
+            throw httpError('Cannot cancel an invoiced/dispatched order', 400);
+          if (ord.rows[0].status === 'CANCELLED') throw httpError('Order is already cancelled', 400);
+          const { rows } = await client.query("UPDATE orders SET status='CANCELLED', updated_at=now() WHERE id=$1 RETURNING *", [id]);
+          // Claw back referral coins earned when the order was placed.
+          await reverseOrderLoyalty(client, id, actor.sub, 'Order cancelled');
+          await logActivity(actor.sub, 'CANCEL_ORDER', 'order', id);
+          return mapOrder(rows[0]);
+        });
       },
 
       // Edit a pre-invoice order. Recomputes all totals from the supplied lines and
@@ -970,6 +1023,7 @@ export function orderResolvers() {
           for (const l of input.lines) {
             const p = (await client.query('SELECT * FROM products WHERE id = $1', [l.productId])).rows[0];
             if (!p) throw httpError('Product not found', 404);
+            assertValidLine(l, p.name);
             const defaultPrice = customerType === 'FARMER'
               ? num(p.mrp ?? p.dealer_price ?? p.distributor_price ?? 0)
               : num(p.distributor_price ?? p.dealer_price ?? p.mrp ?? 0);
@@ -1052,7 +1106,9 @@ export function orderResolvers() {
             await client.query('DELETE FROM invoices WHERE id = $1', [inv.id]);
           }
 
-          // 4) Delete the order — order_lines cascade; loyalty txns & sales returns unlink.
+          // 4) Claw back referral coins earned from this order, then delete —
+          //    order_lines cascade; loyalty txns & sales returns unlink.
+          await reverseOrderLoyalty(client, id, actor.sub, `Order ${ord.order_no} deleted`);
           await client.query('DELETE FROM orders WHERE id = $1', [id]);
           await logActivity(actor.sub, 'DELETE_ORDER', 'order', id, { orderNo: ord.order_no, hadInvoice: !!inv });
           return true;

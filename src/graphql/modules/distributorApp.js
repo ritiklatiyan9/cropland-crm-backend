@@ -455,6 +455,8 @@ export function distributorAppResolvers(app) {
         const prepared = [];
         for (const l of input.lines) {
           if (!(l.quantity > 0)) throw httpError('Each item needs a quantity greater than 0', 400);
+          if (num(l.unitPrice) < 0) throw httpError('Unit price cannot be negative', 400);
+          if (l.gstPercent != null && (num(l.gstPercent) < 0 || num(l.gstPercent) > 100)) throw httpError('GST % must be between 0 and 100', 400);
           let name = (l.productName ?? '').trim();
           let gst = l.gstPercent != null ? num(l.gstPercent) : 0;
           if (l.productId) {
@@ -495,25 +497,25 @@ export function distributorAppResolvers(app) {
       distRecordSalePayment: async (_p, { saleId, amount }, ctx) => {
         const id = distributorId(ctx);
         if (!(amount > 0)) throw httpError('Enter an amount greater than 0', 400);
-        const s = (await query('SELECT * FROM distributor_sales WHERE id = $1 AND distributor_id = $2', [saleId, id])).rows[0];
-        if (!s) throw httpError('Bill not found', 404);
-        const total = num(s.total_amount) ?? 0, already = num(s.amount_paid) ?? 0;
-        const balance = round2(total - already);
-        if (balance <= 0) throw httpError('This bill is already fully paid', 400);
-        const newPaid = round2(Math.min(total, already + amount));
-        const { rows } = await query(
-          `UPDATE distributor_sales s SET amount_paid = $2 FROM (SELECT farmer_code FROM farmers WHERE id = $3) f
-           WHERE s.id = $1 RETURNING s.*, $4::text farmer_code`,
-          [saleId, newPaid, s.farmer_id, s.farmer_id ? null : null],
-        );
-        // Re-fetch with farmer_code join for a clean mapped result.
-        const out = (await query(
-          'SELECT s.*, f.farmer_code FROM distributor_sales s LEFT JOIN farmers f ON f.id = s.farmer_id WHERE s.id = $1',
-          [saleId],
-        )).rows[0];
-        void rows;
-        await logActivity(null, 'DIST_SALE_PAYMENT', 'distributor_sale', saleId, { amount, newPaid, via: 'distributor-app' });
-        return mapSale(out);
+        return withTransaction(async (client) => {
+          // Lock the row so two concurrent collections can't both read the old paid amount.
+          const s = (await client.query('SELECT * FROM distributor_sales WHERE id = $1 AND distributor_id = $2 FOR UPDATE', [saleId, id])).rows[0];
+          if (!s) throw httpError('Bill not found', 404);
+          const total = num(s.total_amount) ?? 0, already = num(s.amount_paid) ?? 0;
+          const balance = round2(total - already);
+          if (balance <= 0) throw httpError('This bill is already fully paid', 400);
+          if (round2(amount) > balance + 0.01) throw httpError(`Payment ₹${amount} exceeds the balance due ₹${balance}`, 400);
+          const newPaid = round2(already + amount);
+          // Plain UPDATE — the previous `UPDATE ... FROM (farmer subquery)` silently
+          // updated ZERO rows for walk-in bills (farmer_id NULL ⇒ empty join relation).
+          await client.query('UPDATE distributor_sales SET amount_paid = $2 WHERE id = $1', [saleId, newPaid]);
+          const out = (await client.query(
+            'SELECT s.*, f.farmer_code FROM distributor_sales s LEFT JOIN farmers f ON f.id = s.farmer_id WHERE s.id = $1',
+            [saleId],
+          )).rows[0];
+          await logActivity(null, 'DIST_SALE_PAYMENT', 'distributor_sale', saleId, { amount, newPaid, via: 'distributor-app' });
+          return mapSale(out);
+        });
       },
     },
 

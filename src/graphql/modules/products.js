@@ -243,7 +243,14 @@ export function productResolvers() {
       },
       deleteProduct: async (_p, { id }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
-        const { rowCount } = await query('DELETE FROM products WHERE id = $1', [id]);
+        let rowCount;
+        try {
+          ({ rowCount } = await query('DELETE FROM products WHERE id = $1', [id]));
+        } catch (err) {
+          // Referenced by orders/invoices/stock (ON DELETE RESTRICT) — a clean guard, not a 500.
+          if (err.code === '23503') throw httpError('This product is used on orders or stock and cannot be deleted. Deactivate it instead.', 409);
+          throw err;
+        }
         if (!rowCount) throw httpError('Product not found', 404);
         await logActivity(actor.sub, 'DELETE_PRODUCT', 'product', id);
         return true;

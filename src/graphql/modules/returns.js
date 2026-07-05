@@ -184,11 +184,14 @@ export function returnsResolvers() {
         if (!input.lines?.length) throw httpError('A return needs at least one line', 400);
         return withTransaction(async (client) => {
           if (!(await client.query('SELECT id FROM distributors WHERE id=$1', [input.distributorId])).rows[0]) throw httpError('Distributor not found', 404);
+          if (!(await client.query('SELECT id FROM warehouses WHERE id=$1', [input.warehouseId])).rows[0]) throw httpError('Warehouse not found', 404);
           let subTotal = 0, taxTotal = 0;
           const prepared = [];
           for (const l of input.lines) {
             const p = (await client.query('SELECT name, gst_percent FROM products WHERE id=$1', [l.productId])).rows[0];
             if (!p) throw httpError('Product not found', 404);
+            if (!(num(l.quantity) > 0)) throw httpError(`${p.name}: quantity must be positive`, 400);
+            if (num(l.unitPrice) < 0) throw httpError(`${p.name}: unit price cannot be negative`, 400);
             const lineTotal = round2(l.quantity * l.unitPrice);
             const gst = num(p.gst_percent ?? 0);
             subTotal += lineTotal; taxTotal += round2(lineTotal * gst / 100);
@@ -242,12 +245,26 @@ export function returnsResolvers() {
             );
           }
 
-          // Credit note -> reduces distributor outstanding.
+          // Credit note -> reduces distributor outstanding. Capture the full GST
+          // breakup (taxable/rate/heads + linked invoice) so GSTR-1 CDNR reports
+          // the note correctly instead of deriving a blended rate.
+          const refInv = sr.order_id
+            ? (await client.query('SELECT id, is_interstate FROM invoices WHERE order_id=$1', [sr.order_id])).rows[0]
+            : null;
+          const interstate = !!refInv?.is_interstate;
+          const taxable = num(sr.sub_total);
+          const tax = num(sr.tax_total);
+          const cgst = interstate ? 0 : round2(tax / 2);
+          const sgst = interstate ? 0 : round2(tax - cgst);
+          const igst = interstate ? tax : 0;
+          const blendedRate = taxable > 0 ? round2((tax / taxable) * 100) : 0;
           const noteNo = `CN-${fy()}-${String((await client.query("SELECT nextval('note_seq') n")).rows[0].n).padStart(5, '0')}`;
           await client.query(
-            `INSERT INTO credit_debit_notes (note_no, distributor_id, note_type, amount, reason, created_by)
-             VALUES ($1,$2,'CREDIT',$3,$4,$5)`,
-            [noteNo, sr.distributor_id, num(sr.total_amount), `Sales return ${sr.return_no}`, a.sub],
+            `INSERT INTO credit_debit_notes (note_no, distributor_id, note_type, amount, reason, ref_invoice_id,
+               taxable_value, gst_rate, cgst, sgst, igst, is_interstate, note_reason, created_by)
+             VALUES ($1,$2,'CREDIT',$3,$4,$5,$6,$7,$8,$9,$10,$11,'01',$12)`,
+            [noteNo, sr.distributor_id, num(sr.total_amount), `Sales return ${sr.return_no}`, refInv?.id ?? null,
+              taxable, blendedRate, cgst, sgst, igst, interstate, a.sub],
           );
           await client.query('UPDATE distributors SET outstanding = GREATEST(outstanding - $2, 0) WHERE id=$1', [sr.distributor_id, num(sr.total_amount)]);
           await client.query("UPDATE sales_returns SET status='APPROVED', credit_note_no=$2, approved_at=now() WHERE id=$1", [id, noteNo]);
@@ -271,11 +288,14 @@ export function returnsResolvers() {
         if (!input.lines?.length) throw httpError('A return needs at least one line', 400);
         return withTransaction(async (client) => {
           if (!(await client.query('SELECT id FROM vendors WHERE id=$1', [input.vendorId])).rows[0]) throw httpError('Vendor not found', 404);
+          if (!(await client.query('SELECT id FROM warehouses WHERE id=$1', [input.warehouseId])).rows[0]) throw httpError('Warehouse not found', 404);
           let subTotal = 0, taxTotal = 0;
           const prepared = [];
           for (const l of input.lines) {
             const p = (await client.query('SELECT name, gst_percent FROM products WHERE id=$1', [l.productId])).rows[0];
             if (!p) throw httpError('Product not found', 404);
+            if (!(num(l.quantity) > 0)) throw httpError(`${p.name}: quantity must be positive`, 400);
+            if (num(l.unitCost) < 0) throw httpError(`${p.name}: unit cost cannot be negative`, 400);
             const lineTotal = round2(l.quantity * l.unitCost);
             const gst = num(p.gst_percent ?? 0);
             subTotal += lineTotal; taxTotal += round2(lineTotal * gst / 100);
@@ -332,8 +352,9 @@ export function returnsResolvers() {
             }
           }
 
-          // Debit note -> reduces vendor payable.
-          const noteNo = `DN-${fy()}-${String((await client.query("SELECT nextval('prn_seq') n")).rows[0].n).padStart(5, '0')}`;
+          // Debit note -> reduces vendor payable. Numbered from note_seq — drawing
+          // from prn_seq would punch holes in the purchase-return number series.
+          const noteNo = `DN-${fy()}-${String((await client.query("SELECT nextval('note_seq') n")).rows[0].n).padStart(5, '0')}`;
           await client.query('UPDATE vendors SET outstanding = GREATEST(outstanding - $2, 0) WHERE id=$1', [pr.vendor_id, num(pr.total_amount)]);
           await client.query("UPDATE purchase_returns SET status='APPROVED', debit_note_no=$2, approved_at=now() WHERE id=$1", [id, noteNo]);
           await logActivity(a.sub, 'APPROVE_PURCHASE_RETURN', 'purchase_return', id, { noteNo });
