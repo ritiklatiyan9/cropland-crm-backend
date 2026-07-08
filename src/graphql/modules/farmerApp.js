@@ -12,6 +12,7 @@ import { diagnoseCrop } from '../../services/ai/index.js';
 import { getTrainingReferences } from './ai.js';
 import { isAwsConfigured, getDownloadUrl } from '../../utils/aws.js';
 import { env } from '../../config/env.js';
+import { sendEmail } from '../../services/notify/email.js';
 
 // Resolve a stored S3 key (or pass-through URL) to a viewable URL.
 async function imgUrl(value) {
@@ -39,6 +40,7 @@ export const farmerAppTypeDefs = /* GraphQL */ `
     pointsBalance: Int!
     photoUrl: String
     authProvider: String!
+    deletionStatus: String   # null / REQUESTED / DELETED — set when a deletion has been requested
   }
   type FarmerAuthPayload { token: String!, farmer: FarmerProfile! }
 
@@ -93,6 +95,9 @@ export const farmerAppTypeDefs = /* GraphQL */ `
     raiseComplaint(input: AppComplaintInput!): AppComplaint!
     runMyDiagnosis(crop: String!, imageUrl: String): AppDiagnosis!
     markAdvisoryRead(id: ID!): Boolean!
+    # Account deletion (Google Play compliance): flags the account for admin review.
+    # Admin then anonymises (approve) or clears the flag (reject).
+    requestMyAccountDeletion(reason: String): Boolean!
   }
 `;
 
@@ -103,6 +108,7 @@ const mapFarmer = (r) => r && {
   village: r.village, tehsil: r.tehsil, district: r.district, state: r.state,
   crops: r.crops ?? [], landSizeAcres: num(r.land_size_acres), language: r.language,
   pointsBalance: r.points_balance ?? 0, photoKey: r.photo_url, authProvider: r.auth_provider ?? 'ADMIN',
+  deletionStatus: r.deletion_status ?? null,
 };
 
 // Resolve the authenticated farmer's id from a FARMER-kind JWT.
@@ -426,6 +432,42 @@ export function farmerAppResolvers(app) {
         const fid = farmerId(ctx);
         // Farmer-specific advisories: mark as READ. Broadcast (farmer_id IS NULL) stay SENT — shared record, not personal.
         await query("UPDATE advisories SET status='READ' WHERE id=$1 AND farmer_id=$2 AND status='SENT'", [id, fid]);
+        return true;
+      },
+
+      // Flag the account for deletion. Idempotent: re-requesting keeps the original
+      // timestamp. An admin reviews the request in the panel and anonymises (approve)
+      // or clears it (reject). Already-deleted accounts cannot re-request.
+      requestMyAccountDeletion: async (_p, { reason }, ctx) => {
+        const id = farmerId(ctx);
+        const { rows } = await query(
+          `UPDATE farmers SET
+             deletion_status = 'REQUESTED',
+             deletion_requested_at = COALESCE(deletion_requested_at, now()),
+             deletion_reason = $2,
+             updated_at = now()
+           WHERE id = $1 AND COALESCE(deletion_status,'') <> 'DELETED'
+           RETURNING farmer_code, name, email, phone`,
+          [id, reason?.trim() || null],
+        );
+        if (!rows[0]) throw httpError('Account not found', 404);
+        await logActivity(null, 'REQUEST_ACCOUNT_DELETION', 'farmer', id, { via: 'farmer-app', reason: reason?.trim() || null });
+        // Best-effort: notify the admin inbox so the request is actioned within 30 days.
+        try {
+          const to = process.env.ACCOUNT_DELETION_NOTIFY_EMAIL || process.env.SMTP_USER;
+          if (to) {
+            const f = rows[0];
+            await sendEmail(
+              [to],
+              `Account deletion request — ${f.name} (${f.farmer_code})`,
+              `A farmer has requested account deletion from the app.\n\n`
+                + `Name: ${f.name}\nFarmer code: ${f.farmer_code}\n`
+                + `Email: ${f.email || '—'}\nPhone: ${f.phone || '—'}\n`
+                + `Reason: ${reason?.trim() || '—'}\n\n`
+                + `Review and action it in the Admin panel → Farmers → "Account deletion requests".`,
+            );
+          }
+        } catch { /* notification is best-effort; never block the request */ }
         return true;
       },
     },

@@ -1150,6 +1150,14 @@ ALTER TABLE farmers ADD COLUMN IF NOT EXISTS google_id TEXT;
 ALTER TABLE farmers ADD COLUMN IF NOT EXISTS photo_url TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_farmers_email_lower ON farmers (lower(email)) WHERE email IS NOT NULL;
 
+-- ── Account deletion (Google Play "Delete account" compliance): the farmer
+-- requests deletion in the app; an admin then approves (anonymises the record,
+-- keeping legally-required financial history) or rejects the request. ──
+ALTER TABLE farmers ADD COLUMN IF NOT EXISTS deletion_status TEXT;             -- NULL / REQUESTED / DELETED
+ALTER TABLE farmers ADD COLUMN IF NOT EXISTS deletion_requested_at TIMESTAMPTZ;
+ALTER TABLE farmers ADD COLUMN IF NOT EXISTS deletion_reason TEXT;
+CREATE INDEX IF NOT EXISTS idx_farmers_deletion_status ON farmers (deletion_status) WHERE deletion_status IS NOT NULL;
+
 -- ── Geolocation + buy-intent enquiries (distributor map + farmer "Buy") ──
 ALTER TABLE distributors ADD COLUMN IF NOT EXISTS gps_lat NUMERIC(10,7);
 ALTER TABLE distributors ADD COLUMN IF NOT EXISTS gps_lng NUMERIC(10,7);

@@ -23,6 +23,9 @@ export const loyaltyTypeDefs = /* GraphQL */ `
     pointsBalance: Int!
     hasDevice: Boolean!
     createdAt: DateTime!
+    deletionStatus: String        # null / REQUESTED / DELETED
+    deletionRequestedAt: DateTime
+    deletionReason: String
   }
 
   type LoyaltyRule {
@@ -50,6 +53,7 @@ export const loyaltyTypeDefs = /* GraphQL */ `
     pointsIssued: Int!
     pointsRedeemed: Int!
     activeBalance: Int!
+    pendingDeletions: Int!
   }
 
   type EmailResult { sent: Int!, status: String!, note: String }
@@ -82,6 +86,7 @@ export const loyaltyTypeDefs = /* GraphQL */ `
     farmer(id: ID!): Farmer
     farmerByCode(farmerCode: String!): Farmer
     farmerStats: FarmerStats!
+    accountDeletionRequests: [Farmer!]!   # farmers who requested deletion from the app
     loyaltyRules(activeOnly: Boolean): [LoyaltyRule!]!
     loyaltyTransactions(farmerId: ID!, limit: Int = 50): [LoyaltyTransaction!]!
   }
@@ -90,6 +95,9 @@ export const loyaltyTypeDefs = /* GraphQL */ `
     registerFarmer(input: FarmerInput!): Farmer!
     updateFarmer(id: ID!, input: FarmerInput!): Farmer!
     deleteFarmer(id: ID!): Boolean!
+    # Account-deletion request workflow (Google Play compliance):
+    approveAccountDeletion(id: ID!): Boolean!   # anonymise PII, keep financial history
+    rejectAccountDeletion(id: ID!): Boolean!    # clear the deletion flag
     registerFarmerDevice(farmerCode: String!, fcmToken: String!): Boolean!
     sendFarmerEmail(farmerId: ID!, subject: String!, body: String!): EmailResult!
 
@@ -120,6 +128,9 @@ const mapFarmer = (r) =>
     pointsBalance: r.points_balance ?? 0,
     hasDevice: Boolean(r.fcm_token),
     createdAt: r.created_at,
+    deletionStatus: r.deletion_status ?? null,
+    deletionRequestedAt: r.deletion_requested_at ?? null,
+    deletionReason: r.deletion_reason ?? null,
   };
 
 const mapRule = (r) =>
@@ -185,7 +196,12 @@ export function loyaltyResolvers() {
       },
       farmerStats: async (_p, _a, ctx) => {
         assertAuth(ctx);
-        const t = await query('SELECT COUNT(*)::int AS total, COALESCE(SUM(points_balance),0)::int AS bal FROM farmers');
+        const t = await query(
+          `SELECT COUNT(*)::int AS total,
+                  COALESCE(SUM(points_balance),0)::int AS bal,
+                  COUNT(*) FILTER (WHERE deletion_status = 'REQUESTED')::int AS pending_deletions
+           FROM farmers`,
+        );
         const p = await query(
           `SELECT COALESCE(SUM(points) FILTER (WHERE points > 0),0)::int AS issued,
                   COALESCE(-SUM(points) FILTER (WHERE points < 0),0)::int AS redeemed
@@ -196,7 +212,15 @@ export function loyaltyResolvers() {
           activeBalance: t.rows[0].bal,
           pointsIssued: p.rows[0].issued,
           pointsRedeemed: p.rows[0].redeemed,
+          pendingDeletions: t.rows[0].pending_deletions,
         };
+      },
+      accountDeletionRequests: async (_p, _a, ctx) => {
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
+        const { rows } = await query(
+          "SELECT * FROM farmers WHERE deletion_status = 'REQUESTED' ORDER BY deletion_requested_at ASC",
+        );
+        return rows.map(mapFarmer);
       },
       loyaltyRules: async (_p, { activeOnly }, ctx) => {
         assertAuth(ctx);
@@ -271,6 +295,41 @@ export function loyaltyResolvers() {
         const { rowCount } = await query('DELETE FROM farmers WHERE id = $1', [id]);
         if (!rowCount) throw httpError('Farmer not found', 404);
         await logActivity(actor.sub, 'DELETE_FARMER', 'farmer', id);
+        return true;
+      },
+
+      // Approve an app-initiated deletion request by ANONYMISING the record:
+      // strip all personal data + login credentials but keep the row so the
+      // legally-required financial history (invoices, sales, loyalty) stays intact.
+      approveAccountDeletion: async (_p, { id }, ctx) => {
+        const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        const { rows } = await query('SELECT deletion_status FROM farmers WHERE id = $1', [id]);
+        if (!rows[0]) throw httpError('Farmer not found', 404);
+        await query(
+          `UPDATE farmers SET
+             name = 'Deleted Farmer', email = NULL, phone = NULL,
+             village = NULL, tehsil = NULL, district = NULL, state = NULL,
+             crops = '{}', land_size_acres = NULL, gps_lat = NULL, gps_lng = NULL,
+             password_hash = NULL, google_id = NULL, photo_url = NULL, fcm_token = NULL,
+             auth_provider = 'DELETED',
+             deletion_status = 'DELETED',
+             deletion_requested_at = COALESCE(deletion_requested_at, now()),
+             updated_at = now()
+           WHERE id = $1`,
+          [id],
+        );
+        await logActivity(actor.sub, 'APPROVE_ACCOUNT_DELETION', 'farmer', id);
+        return true;
+      },
+      // Reject / dismiss a deletion request — clears the flag, account stays active.
+      rejectAccountDeletion: async (_p, { id }, ctx) => {
+        const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        const { rowCount } = await query(
+          "UPDATE farmers SET deletion_status = NULL, deletion_requested_at = NULL, deletion_reason = NULL, updated_at = now() WHERE id = $1 AND deletion_status = 'REQUESTED'",
+          [id],
+        );
+        if (!rowCount) throw httpError('No pending deletion request for this farmer', 404);
+        await logActivity(actor.sub, 'REJECT_ACCOUNT_DELETION', 'farmer', id);
         return true;
       },
       registerFarmerDevice: async (_p, { farmerCode, fcmToken }, ctx) => {
