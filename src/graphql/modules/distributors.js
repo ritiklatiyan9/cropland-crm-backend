@@ -157,12 +157,8 @@ export function distributorResolvers() {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const { rows } = await query(
           `INSERT INTO distributors
-<<<<<<< HEAD
-             (name, contact_person, phone, email, gstin, dealer_tier, state, district, address, branch_id, credit_limit, gps_lat, gps_lng, udyam_no, msme_type, msme_registered, msme_reg_date)
-=======
              (name, contact_person, phone, email, gstin, dealer_tier, state, district, address,
               branch_id, credit_limit, gps_lat, gps_lng, udyam_no, msme_type, msme_registered, msme_reg_date)
->>>>>>> 7651c4f (fix party input schema on deployed branch)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
           vals(input),
         );

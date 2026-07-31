@@ -148,9 +148,6 @@ const mapPInv = (r) =>
     invoiceDate: isoDate(r.invoice_date), totalAmount: num(r.total_amount),
     amountPaid: num(r.amount_paid), balanceDue: num(r.total_amount) - num(r.amount_paid), createdAt: r.created_at,
   };
-<<<<<<< HEAD
-const vVals = (i) => [i.name, i.contactPerson ?? null, i.phone ?? null, i.email ?? null, i.gstin ?? null, i.address ?? null, i.city ?? null, i.state ?? null, i.udyamNo ?? null, i.msmeType ?? null, i.msmeRegistered ?? false, i.msmeRegDate ?? null, i.paymentTermsDays ?? 45];
-=======
 const vVals = (i) => [
   i.name,
   i.contactPerson ?? null,
@@ -166,7 +163,6 @@ const vVals = (i) => [
   i.msmeRegDate ?? null,
   i.paymentTermsDays ?? 45,
 ];
->>>>>>> 7651c4f (fix party input schema on deployed branch)
 
 export function procurementResolvers() {
   return {
@@ -226,33 +222,23 @@ export function procurementResolvers() {
       createVendor: async (_p, { input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
         const { rows } = await query(
-<<<<<<< HEAD
-          `INSERT INTO vendors (name, contact_person, phone, email, gstin, address, city, state, udyam_no, msme_type, msme_registered, msme_reg_date, payment_terms_days)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`, vVals(input));
-=======
           `INSERT INTO vendors
              (name, contact_person, phone, email, gstin, address, city, state,
               udyam_no, msme_type, msme_registered, msme_reg_date, payment_terms_days)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
           vVals(input),
         );
->>>>>>> 7651c4f (fix party input schema on deployed branch)
         await logActivity(a.sub, 'CREATE_VENDOR', 'vendor', rows[0].id);
         return mapVendor(rows[0]);
       },
       updateVendor: async (_p, { id, input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
         const { rows } = await query(
-<<<<<<< HEAD
-          `UPDATE vendors SET name=$2, contact_person=$3, phone=$4, email=$5, gstin=$6, address=$7, city=$8, state=$9,
-             udyam_no=$10, msme_type=$11, msme_registered=$12, msme_reg_date=$13, payment_terms_days=$14, updated_at=now() WHERE id=$1 RETURNING *`,
-=======
           `UPDATE vendors SET
              name=$2, contact_person=$3, phone=$4, email=$5, gstin=$6, address=$7, city=$8, state=$9,
              udyam_no=$10, msme_type=$11, msme_registered=$12, msme_reg_date=$13,
              payment_terms_days=$14, updated_at=now()
            WHERE id=$1 RETURNING *`,
->>>>>>> 7651c4f (fix party input schema on deployed branch)
           [id, ...vVals(input)]);
         if (!rows[0]) throw httpError('Vendor not found', 404);
         await logActivity(a.sub, 'UPDATE_VENDOR', 'vendor', id);
